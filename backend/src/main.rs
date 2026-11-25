@@ -1,11 +1,15 @@
+mod ai;
 mod auth;
 mod config;
 mod db;
+mod environment;
 mod error;
 mod orbit;
 mod routes;
 mod scenario;
+mod sensor;
 mod space;
+mod spaceenv;
 mod state;
 
 use std::net::SocketAddr;
@@ -37,10 +41,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let auth = auth::AuthService::new(config.jwt_secret.clone(), config.jwt_ttl_hours);
     let space = space::SpaceContext::new()?;
+    let ai = ai::AiClient::new(&config);
+    if ai.enabled() {
+        tracing::info!("AI 功能已启用");
+    } else {
+        tracing::warn!("AI 功能未启用（缺少 KST_AI_API_KEY / KST_AI_MODEL 或显式关闭）");
+    }
     let state = state::AppState {
         pool,
         auth,
         space: std::sync::Arc::new(space),
+        ai: std::sync::Arc::new(ai),
     };
 
     let app = Router::new()

@@ -3,6 +3,7 @@ use serde::Serialize;
 
 use crate::{auth, state::AppState};
 
+mod ai;
 mod compute;
 mod jobs;
 mod scenarios;
@@ -15,6 +16,7 @@ pub fn router() -> Router<AppState> {
         .nest("/compute", compute::router())
         .nest("/scenarios", scenarios::router())
         .nest("/jobs", jobs::router())
+        .nest("/ai", ai::router())
 }
 
 #[derive(Serialize)]

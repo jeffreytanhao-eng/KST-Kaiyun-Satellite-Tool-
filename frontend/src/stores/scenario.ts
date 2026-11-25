@@ -17,6 +17,9 @@ import {
   createJob,
   waitForJob,
   type AccessReport,
+  type CoverageRegion,
+  type CoverageReport,
+  type EnvironmentReport,
   type Job,
   type PropagationReport
 } from '@/api/jobs'
@@ -56,6 +59,14 @@ export const useScenarioStore = defineStore('scenario', () => {
   const accessJob = ref<Job | null>(null)
   const accessBusy = ref(false)
 
+  const coverageReport = ref<CoverageReport | null>(null)
+  const coverageJob = ref<Job | null>(null)
+  const coverageBusy = ref(false)
+
+  const environmentReport = ref<EnvironmentReport | null>(null)
+  const environmentJob = ref<Job | null>(null)
+  const environmentBusy = ref(false)
+
   const hasSatellites = computed(() => (current.value?.data.satellites.length ?? 0) > 0)
   const hasStations = computed(
     () => (current.value?.data.ground_stations.length ?? 0) > 0
@@ -66,6 +77,10 @@ export const useScenarioStore = defineStore('scenario', () => {
     propagationJob.value = null
     accessReport.value = null
     accessJob.value = null
+    coverageReport.value = null
+    coverageJob.value = null
+    environmentReport.value = null
+    environmentJob.value = null
   }
 
   async function loadList() {
@@ -87,7 +102,7 @@ export const useScenarioStore = defineStore('scenario', () => {
     current.value = await getScenario(current.value.id)
   }
 
-  async function create(name: string, description = '', data: ScenarioData = { satellites: [], ground_stations: [] }) {
+  async function create(name: string, description = '', data: ScenarioData = { satellites: [], ground_stations: [], sensors: [] }) {
     const created = await createScenario({ name, description, data })
     await loadList()
     await select(created.id)
@@ -95,10 +110,12 @@ export const useScenarioStore = defineStore('scenario', () => {
   }
 
   async function createDemo() {
+    const leoId = newId()
+    const meoId = newId()
     const data: ScenarioData = {
       satellites: [
         {
-          id: newId(),
+          id: leoId,
           name: 'KST-SAT-01 · LEO',
           enabled: true,
           color: PALETTE[0],
@@ -107,7 +124,7 @@ export const useScenarioStore = defineStore('scenario', () => {
           norad_id: 90001
         },
         {
-          id: newId(),
+          id: meoId,
           name: 'KST-SAT-02 · MEO',
           enabled: true,
           color: PALETTE[1],
@@ -146,9 +163,43 @@ export const useScenarioStore = defineStore('scenario', () => {
           altitude_km: 0.02,
           min_elevation_deg: 5
         }
+      ],
+      sensors: [
+        {
+          id: newId(),
+          name: 'LEO 宽幅对地',
+          enabled: true,
+          color: '#4fc3f7',
+          satellite_id: leoId,
+          shape: 'conical',
+          half_angle_deg: 45,
+          horizontal_fov_deg: 30,
+          vertical_fov_deg: 30,
+          pointing_mode: 'nadir',
+          fixed_azimuth_deg: 0,
+          fixed_off_nadir_deg: 0,
+          target_station_id: null,
+          max_range_km: 2500
+        },
+        {
+          id: newId(),
+          name: 'MEO 区域扫描',
+          enabled: true,
+          color: '#ffb74d',
+          satellite_id: meoId,
+          shape: 'rectangular',
+          half_angle_deg: 20,
+          horizontal_fov_deg: 24,
+          vertical_fov_deg: 12,
+          pointing_mode: 'fixed',
+          fixed_azimuth_deg: 25,
+          fixed_off_nadir_deg: 20,
+          target_station_id: null,
+          max_range_km: 6000
+        }
       ]
     }
-    return create('示例场景 · 多对象分析', '包含 3 颗卫星与 2 个地面站的演示场景', data)
+    return create('示例场景 · 多对象分析', '包含 3 颗卫星、2 个地面站与 2 个传感器的演示场景', data)
   }
 
   async function save(payload: Partial<ScenarioPayload>) {
@@ -194,6 +245,9 @@ export const useScenarioStore = defineStore('scenario', () => {
     const data = (candidate.data ?? raw) as ScenarioData
     if (!Array.isArray(data.satellites) || !Array.isArray(data.ground_stations)) {
       throw new Error('JSON 中缺少 satellites / ground_stations')
+    }
+    if (!Array.isArray(data.sensors)) {
+      data.sensors = []
     }
     const created = await importScenario({
       name: candidate.name?.trim() || '导入场景',
@@ -250,6 +304,9 @@ export const useScenarioStore = defineStore('scenario', () => {
     end: Date
     stepSeconds?: number
     minElevationDeg?: number | null
+    azimuthMinDeg?: number | null
+    azimuthMaxDeg?: number | null
+    sensorId?: string | null
   }) {
     if (!current.value || accessBusy.value) return null
     accessBusy.value = true
@@ -266,7 +323,14 @@ export const useScenarioStore = defineStore('scenario', () => {
           step_seconds: params.stepSeconds ?? 30,
           ...(params.minElevationDeg != null
             ? { min_elevation_deg: params.minElevationDeg }
-            : {})
+            : {}),
+          ...(params.azimuthMinDeg != null && params.azimuthMaxDeg != null
+            ? {
+                azimuth_min_deg: params.azimuthMinDeg,
+                azimuth_max_deg: params.azimuthMaxDeg
+              }
+            : {}),
+          ...(params.sensorId ? { sensor_id: params.sensorId } : {})
         }
       })
       accessJob.value = job
@@ -282,6 +346,94 @@ export const useScenarioStore = defineStore('scenario', () => {
     }
   }
 
+  async function runCoverage(params: {
+    satelliteIds: string[]
+    start: Date
+    end: Date
+    stepSeconds?: number
+    region: CoverageRegion
+    gridStepDeg?: number
+    minElevationDeg?: number
+  }) {
+    if (!current.value || coverageBusy.value) return null
+    coverageBusy.value = true
+    coverageReport.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'coverage',
+        params: {
+          ...(params.satelliteIds.length > 0
+            ? { satellite_ids: params.satelliteIds }
+            : {}),
+          start: params.start.toISOString(),
+          end: params.end.toISOString(),
+          step_seconds: params.stepSeconds ?? 60,
+          region: params.region,
+          grid_step_deg: params.gridStepDeg ?? 2,
+          min_elevation_deg: params.minElevationDeg ?? 5
+        }
+      })
+      coverageJob.value = job
+      const done = await waitForJob(job.id)
+      coverageJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '覆盖计算失败')
+      }
+      coverageReport.value = done.result as CoverageReport
+      return coverageReport.value
+    } finally {
+      coverageBusy.value = false
+    }
+  }
+
+  async function runEnvironment(params: {
+    satelliteId: string
+    start: Date
+    end: Date
+    stepSeconds?: number
+    massKg?: number
+    areaM2?: number
+    dragCoefficient?: number
+    dailyF107?: number
+    meanF107?: number
+    ap?: number
+  }) {
+    if (!current.value || environmentBusy.value) return null
+    environmentBusy.value = true
+    environmentReport.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'environment',
+        params: {
+          satellite_id: params.satelliteId,
+          start: params.start.toISOString(),
+          end: params.end.toISOString(),
+          step_seconds: params.stepSeconds ?? 120,
+          options: {
+            mass_kg: params.massKg ?? 500,
+            area_m2: params.areaM2 ?? 2,
+            drag_coefficient: params.dragCoefficient ?? 2.2,
+            daily_f107_sfu: params.dailyF107 ?? 150,
+            mean81_f107_sfu: params.meanF107 ?? 150,
+            ap: params.ap ?? 4
+          }
+        }
+      })
+      environmentJob.value = job
+      const done = await waitForJob(job.id)
+      environmentJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '环境计算失败')
+      }
+      environmentReport.value = done.result as EnvironmentReport
+      return environmentReport.value
+    } finally {
+      environmentBusy.value = false
+    }
+  }
+
   return {
     scenarios,
     current,
@@ -293,6 +445,12 @@ export const useScenarioStore = defineStore('scenario', () => {
     accessReport,
     accessJob,
     accessBusy,
+    coverageReport,
+    coverageJob,
+    coverageBusy,
+    environmentReport,
+    environmentJob,
+    environmentBusy,
     hasSatellites,
     hasStations,
     loadList,
@@ -306,6 +464,8 @@ export const useScenarioStore = defineStore('scenario', () => {
     importFromJson,
     runPropagation,
     runAccess,
+    runCoverage,
+    runEnvironment,
     resetResults
   }
 })

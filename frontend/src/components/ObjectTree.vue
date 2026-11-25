@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { Delete, Plus } from '@element-plus/icons-vue'
 
-import type { GroundStationObject, SatelliteObject } from '@/api/scenarios'
+import type { GroundStationObject, SatelliteObject, SensorObject } from '@/api/scenarios'
 import { useI18n } from '@/i18n'
 
-type ObjectType = 'satellite' | 'station'
+type ObjectType = 'satellite' | 'station' | 'sensor'
 
 interface ObjectSelection {
   type: ObjectType
@@ -14,6 +14,7 @@ interface ObjectSelection {
 defineProps<{
   satellites: SatelliteObject[]
   stations: GroundStationObject[]
+  sensors: SensorObject[]
   selected: ObjectSelection | null
 }>()
 
@@ -114,6 +115,45 @@ function isActive(
         </el-button>
       </div>
     </section>
+
+    <section class="group">
+      <header class="group-head">
+        <span class="group-title">{{ t('sensors') }} · {{ sensors.length }}</span>
+        <el-button link size="small" class="add" :title="t('addSensor')" @click="emit('add', 'sensor')">
+          <el-icon><Plus /></el-icon>
+        </el-button>
+      </header>
+      <div v-if="sensors.length === 0" class="empty">{{ t('noSensors') }}</div>
+      <div
+        v-for="sensor in sensors"
+        :key="sensor.id"
+        class="item"
+        :class="{ active: isActive(selected, 'sensor', sensor.id) }"
+        @click="emit('select', { type: 'sensor', id: sensor.id })"
+      >
+        <span class="dot triangle" :style="{ background: sensor.color || '#b39ddb' }" />
+        <span class="name" :title="sensor.name">{{ sensor.name }}</span>
+        <el-switch
+          size="small"
+          :model-value="sensor.enabled"
+          class="toggle"
+          @click.stop
+          @update:model-value="
+            (value: string | number | boolean) =>
+              emit('toggle', { type: 'sensor', id: sensor.id, enabled: Boolean(value) })
+          "
+        />
+        <el-button
+          link
+          size="small"
+          class="remove"
+          :title="t('delete')"
+          @click.stop="emit('delete', { type: 'sensor', id: sensor.id })"
+        >
+          <el-icon><Delete /></el-icon>
+        </el-button>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -192,6 +232,12 @@ function isActive(
 
 .dot.square {
   border-radius: 2px;
+}
+
+.dot.triangle {
+  border-radius: 2px;
+  transform: rotate(45deg);
+  box-shadow: none;
 }
 
 .name {

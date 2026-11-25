@@ -21,9 +21,30 @@ export interface GroundStationObject {
   min_elevation_deg: number
 }
 
+export type SensorShape = 'conical' | 'rectangular'
+export type SensorPointingMode = 'nadir' | 'fixed' | 'target'
+
+export interface SensorObject {
+  id: string
+  name: string
+  enabled: boolean
+  color: string
+  satellite_id: string
+  shape: SensorShape
+  half_angle_deg: number
+  horizontal_fov_deg: number
+  vertical_fov_deg: number
+  pointing_mode: SensorPointingMode
+  fixed_azimuth_deg: number
+  fixed_off_nadir_deg: number
+  target_station_id?: string | null
+  max_range_km: number
+}
+
 export interface ScenarioData {
   satellites: SatelliteObject[]
   ground_stations: GroundStationObject[]
+  sensors: SensorObject[]
 }
 
 export interface Scenario {
@@ -85,5 +106,5 @@ export function importScenario(payload: ScenarioPayload) {
 }
 
 export function emptyScenarioData(): ScenarioData {
-  return { satellites: [], ground_stations: [] }
+  return { satellites: [], ground_stations: [], sensors: [] }
 }

@@ -2,7 +2,16 @@ import { onBeforeUnmount, ref, shallowRef, type Ref } from 'vue'
 import * as Cesium from 'cesium'
 
 import type { ScenarioData, SatelliteObject } from '@/api/scenarios'
-import type { AccessReport, AccessWindow, SatelliteTrack, TrackSample } from '@/api/jobs'
+import type {
+  AccessReport,
+  AccessWindow,
+  CoverageReport,
+  PropagationReport,
+  SatelliteTrack,
+  SensorSample,
+  SensorTrack,
+  TrackSample
+} from '@/api/jobs'
 
 const ACCESS_COLOR = '#ffb74d'
 
@@ -10,6 +19,12 @@ interface SatelliteVisual {
   data: SatelliteObject
   track: SatelliteTrack | null
   entity: Cesium.Entity
+}
+
+interface SensorVisual {
+  track: SensorTrack
+  satelliteEnabled: boolean
+  entities: Cesium.Entity[]
 }
 
 interface StationPosition {
@@ -29,12 +44,14 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
   const satellites = new Map<string, SatelliteVisual>()
   const stations = new Map<string, StationPosition>()
   const stationEntities = new Map<string, Cesium.Entity>()
+  const sensorVisuals: SensorVisual[] = []
 
   let accessWindows: AccessWindow[] = []
   let accessSatelliteId: string | null = null
   let accessStationId: string | null = null
   let accessEntities: Cesium.Entity[] = []
   let linkEntity: Cesium.Entity | null = null
+  let coveragePrimitive: Cesium.Primitive | null = null
   let playhead = 0
   async function init() {
     if (!host.value) return
@@ -105,6 +122,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     satellites.clear()
     stations.clear()
     stationEntities.clear()
+    sensorVisuals.length = 0
     accessWindows = []
     accessSatelliteId = null
     accessStationId = null
@@ -113,7 +131,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     playhead = 0
   }
 
-  function renderScenario(data: ScenarioData, tracks: SatelliteTrack[] | null) {
+  function renderScenario(data: ScenarioData, report: PropagationReport | null) {
     const instance = viewer.value
     if (!instance) return
 
@@ -157,7 +175,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     }
 
     const trackMap = new Map<string, SatelliteTrack>()
-    for (const track of tracks ?? []) {
+    for (const track of report?.satellites ?? []) {
       trackMap.set(track.satellite_id, track)
     }
 
@@ -222,6 +240,66 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
       satellites.set(satellite.id, { data: satellite, track, entity })
     })
 
+    const sensorMap = new Map(data.sensors.map((sensor) => [sensor.id, sensor]))
+    for (const track of report?.sensor_tracks ?? []) {
+      const sensor = sensorMap.get(track.sensor_id)
+      const satellite = satellites.get(track.satellite_id)
+      if (!sensor || !sensor.enabled || !satellite) continue
+      const color = Cesium.Color.fromCssColorString(track.color || fallbackColor(0))
+      const entities: Cesium.Entity[] = []
+
+      if (track.shape === 'rectangular') {
+        for (let index = 0; index < 4; index += 1) {
+          entities.push(
+            instance.entities.add({
+              id: `sensor-edge-${track.sensor_id}-${index}`,
+              show: false,
+              polyline: {
+                positions: [] as Cesium.Cartesian3[],
+                width: 1.4,
+                arcType: Cesium.ArcType.NONE,
+                material: color.withAlpha(0.8)
+              }
+            })
+          )
+        }
+        entities.push(
+          instance.entities.add({
+            id: `sensor-face-${track.sensor_id}`,
+            show: false,
+            polygon: {
+              hierarchy: new Cesium.PolygonHierarchy([]),
+              material: color.withAlpha(0.16),
+              outline: true,
+              outlineColor: color.withAlpha(0.55)
+            }
+          })
+        )
+      } else {
+        const length = track.max_range_km * 1000
+        entities.push(
+          instance.entities.add({
+            id: `sensor-cone-${track.sensor_id}`,
+            show: false,
+            cylinder: {
+              length,
+              topRadius: length * Math.tan(Cesium.Math.toRadians(track.half_angle_deg)),
+              bottomRadius: 0,
+              material: color.withAlpha(0.18),
+              outline: true,
+              outlineColor: color.withAlpha(0.5)
+            }
+          })
+        )
+      }
+
+      sensorVisuals.push({
+        track,
+        satelliteEnabled: satellite.data.enabled,
+        entities
+      })
+    }
+
     playhead = 0
     setPlayhead(0)
   }
@@ -244,7 +322,154 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
       )
     }
 
+    updateSensors(tSeconds)
     updateAccessLink()
+  }
+
+  function updateSensors(tSeconds: number) {
+    for (const visual of sensorVisuals) {
+      const satellite = satellites.get(visual.track.satellite_id)
+      const satelliteSample = satellite?.track
+        ? sampleAt(satellite.track.samples, tSeconds)
+        : null
+      const frame = sensorSampleAt(visual.track.samples, tSeconds)
+      if (!visual.satelliteEnabled || !satelliteSample || !frame) {
+        for (const entity of visual.entities) entity.show = false
+        continue
+      }
+
+      const apex = Cesium.Cartesian3.fromDegrees(
+        satelliteSample.longitude_deg,
+        satelliteSample.latitude_deg,
+        satelliteSample.altitude_km * 1000
+      )
+      const boresight = new Cesium.Cartesian3(...frame.boresight)
+      const right = new Cesium.Cartesian3(...frame.right)
+      const up = new Cesium.Cartesian3(...frame.up)
+      const length = visual.track.max_range_km * 1000
+
+      if (visual.track.shape === 'rectangular') {
+        const halfHorizontal = Math.tan(
+          Cesium.Math.toRadians(visual.track.horizontal_fov_deg / 2)
+        ) * length
+        const halfVertical = Math.tan(
+          Cesium.Math.toRadians(visual.track.vertical_fov_deg / 2)
+        ) * length
+        const far = Cesium.Cartesian3.add(
+          apex,
+          Cesium.Cartesian3.multiplyByScalar(boresight, length, new Cesium.Cartesian3()),
+          new Cesium.Cartesian3()
+        )
+        const corners = [
+          [1, 1],
+          [-1, 1],
+          [-1, -1],
+          [1, -1]
+        ].map(([horizontal, vertical]) => {
+          const offset = Cesium.Cartesian3.add(
+            Cesium.Cartesian3.multiplyByScalar(
+              right,
+              horizontal * halfHorizontal,
+              new Cesium.Cartesian3()
+            ),
+            Cesium.Cartesian3.multiplyByScalar(
+              up,
+              vertical * halfVertical,
+              new Cesium.Cartesian3()
+            ),
+            new Cesium.Cartesian3()
+          )
+          return Cesium.Cartesian3.add(far, offset, new Cesium.Cartesian3())
+        })
+
+        for (let index = 0; index < 4; index += 1) {
+          const edge = visual.entities[index]
+          if (!edge.polyline) continue
+          edge.polyline.positions = new Cesium.ConstantProperty([apex, corners[index]])
+          edge.show = true
+        }
+        const face = visual.entities[4]
+        if (face.polygon) {
+          face.polygon.hierarchy = new Cesium.ConstantProperty(
+            new Cesium.PolygonHierarchy(corners)
+          )
+          face.show = true
+        }
+      } else {
+        const entity = visual.entities[0]
+        const center = Cesium.Cartesian3.add(
+          apex,
+          Cesium.Cartesian3.multiplyByScalar(
+            boresight,
+            length / 2,
+            new Cesium.Cartesian3()
+          ),
+          new Cesium.Cartesian3()
+        )
+        entity.position = new Cesium.ConstantPositionProperty(center)
+        entity.orientation = new Cesium.ConstantProperty(
+          quaternionFromFrame(frame)
+        )
+        entity.show = true
+      }
+    }
+  }
+
+  function showCoverage(report: CoverageReport | null) {
+    const instance = viewer.value
+    if (!instance) return
+    clearCoverage()
+    if (!report || report.points.length === 0) return
+
+    const maxVisible = Math.max(report.max_visible_seconds, 1)
+    const half = report.grid_step_deg / 2
+    const instances: Cesium.GeometryInstance[] = []
+    for (const point of report.points) {
+      if (!point.covered) continue
+      const ratio = Math.min(1, point.visible_seconds / maxVisible)
+      const color = Cesium.Color.fromHsl(
+        0.55 - 0.55 * ratio,
+        0.85,
+        0.5,
+        0.3 + 0.35 * ratio
+      )
+      const south = Math.max(point.latitude_deg - half, -89.9)
+      const north = Math.min(point.latitude_deg + half, 89.9)
+      const west = Math.max(point.longitude_deg - half, -179.9)
+      const east = Math.min(point.longitude_deg + half, 179.9)
+      instances.push(
+        new Cesium.GeometryInstance({
+          geometry: new Cesium.RectangleGeometry({
+            rectangle: Cesium.Rectangle.fromDegrees(west, south, east, north),
+            height: 1500,
+            vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT
+          }),
+          attributes: {
+            color: Cesium.ColorGeometryInstanceAttribute.fromColor(color)
+          }
+        })
+      )
+    }
+    if (instances.length === 0) return
+
+    coveragePrimitive = instance.scene.primitives.add(
+      new Cesium.Primitive({
+        geometryInstances: instances,
+        appearance: new Cesium.PerInstanceColorAppearance({
+          translucent: true,
+          closed: false
+        }),
+        asynchronous: false
+      })
+    )
+  }
+
+  function clearCoverage() {
+    const instance = viewer.value
+    if (instance && coveragePrimitive) {
+      instance.scene.primitives.remove(coveragePrimitive)
+    }
+    coveragePrimitive = null
   }
 
   function updateAccessLink() {
@@ -422,6 +647,8 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     renderScenario,
     setPlayhead,
     highlightAccess,
+    showCoverage,
+    clearCoverage,
     flyToScenario,
     flyToLocation,
     destroy
@@ -457,4 +684,56 @@ function sampleAt(samples: TrackSample[], tSeconds: number): TrackSample | null 
     latitude_deg: a.latitude_deg + (b.latitude_deg - a.latitude_deg) * fraction,
     altitude_km: a.altitude_km + (b.altitude_km - a.altitude_km) * fraction
   }
+}
+
+/** 插值传感器指向基，并重新归一化各轴。 */
+function sensorSampleAt(
+  samples: SensorSample[],
+  tSeconds: number
+): SensorSample | null {
+  if (samples.length === 0) return null
+  const first = samples[0]
+  const last = samples[samples.length - 1]
+  if (tSeconds <= first.t_seconds) return first
+  if (tSeconds >= last.t_seconds) return last
+
+  const step = samples.length > 1 ? samples[1].t_seconds - first.t_seconds : 1
+  const index = Math.min(
+    Math.max(Math.floor((tSeconds - first.t_seconds) / (step || 1)), 0),
+    samples.length - 2
+  )
+  const a = samples[index]
+  const b = samples[index + 1]
+  const span = b.t_seconds - a.t_seconds || 1
+  const fraction = (tSeconds - a.t_seconds) / span
+
+  const lerp = (from: [number, number, number], to: [number, number, number]) =>
+    normalizeVector([
+      from[0] + (to[0] - from[0]) * fraction,
+      from[1] + (to[1] - from[1]) * fraction,
+      from[2] + (to[2] - from[2]) * fraction
+    ])
+
+  return {
+    t_seconds: tSeconds,
+    boresight: lerp(a.boresight, b.boresight),
+    right: lerp(a.right, b.right),
+    up: lerp(a.up, b.up)
+  }
+}
+
+function normalizeVector(
+  vector: [number, number, number]
+): [number, number, number] {
+  const norm = Math.hypot(vector[0], vector[1], vector[2]) || 1
+  return [vector[0] / norm, vector[1] / norm, vector[2] / norm]
+}
+
+/** 由右/上/前向轴构造旋转四元数（局部 +Z 对齐传感器视轴）。 */
+function quaternionFromFrame(frame: SensorSample): Cesium.Quaternion {
+  const [rx, ry, rz] = frame.right
+  const [ux, uy, uz] = frame.up
+  const [bx, by, bz] = frame.boresight
+  const matrix = new Cesium.Matrix3(rx, ux, bx, ry, uy, by, rz, uz, bz)
+  return Cesium.Quaternion.fromRotationMatrix(matrix)
 }

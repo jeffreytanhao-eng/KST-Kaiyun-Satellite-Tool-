@@ -3,16 +3,24 @@ use serde::{Deserialize, Serialize};
 use sgp4::{Constants, Elements};
 use stkcraft_geocalc::coords::{to_coordinates, CoordinateSystem};
 
-use crate::scenario::{GroundStationObject, ScenarioData, SatelliteObject};
+use crate::scenario::{GroundStationObject, ScenarioData, SatelliteObject, SensorObject};
+use crate::sensor;
 
 /// WGS84/IAU 地球赤道半径与极半径（km）。
 const EARTH_RADII: [f64; 3] = [6378.1366, 6378.1366, 6356.7519];
 /// 单个任务的采样点上限，避免异常请求拖垮服务。
 const MAX_SAMPLES: usize = 20_000;
+/// 覆盖网格点上限。
+pub const MAX_COVERAGE_POINTS: usize = 5_000;
 
 const FALLBACK_COLORS: [&str; 6] = [
     "#4fc3f7", "#ffb74d", "#81c784", "#e57373", "#ba68c8", "#4db6ac",
 ];
+
+pub const CONSTRAINT_ELEVATION: &str = "min_elevation";
+pub const CONSTRAINT_AZIMUTH: &str = "azimuth_range";
+pub const CONSTRAINT_OCCLUSION: &str = "earth_occlusion";
+pub const CONSTRAINT_SENSOR: &str = "sensor_fov";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackSample {
@@ -30,12 +38,38 @@ pub struct SatelliteTrack {
     pub samples: Vec<TrackSample>,
 }
 
+/// 传感器在某采样时刻的指向基，供三维视场渲染使用。
+#[derive(Debug, Clone, Serialize)]
+pub struct SensorSample {
+    pub t_seconds: f64,
+    pub boresight: [f64; 3],
+    pub right: [f64; 3],
+    pub up: [f64; 3],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SensorTrack {
+    pub sensor_id: String,
+    pub sensor_name: String,
+    pub satellite_id: String,
+    pub color: String,
+    pub shape: String,
+    pub half_angle_deg: f64,
+    pub horizontal_fov_deg: f64,
+    pub vertical_fov_deg: f64,
+    pub max_range_km: f64,
+    pub pointing_mode: String,
+    pub samples: Vec<SensorSample>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PropagationReport {
     pub start: String,
     pub end: String,
     pub step_seconds: f64,
     pub satellites: Vec<SatelliteTrack>,
+    #[serde(default)]
+    pub sensor_tracks: Vec<SensorTrack>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +81,9 @@ pub struct AccessWindow {
     pub end_seconds: f64,
     pub duration_seconds: f64,
     pub max_elevation_deg: f64,
+    /// 该窗口满足的约束类型。
+    #[serde(default)]
+    pub constraints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +99,67 @@ pub struct AccessReport {
     pub window_count: u32,
     pub total_duration_seconds: f64,
     pub longest_window_seconds: f64,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub azimuth_min_deg: Option<f64>,
+    #[serde(default)]
+    pub azimuth_max_deg: Option<f64>,
+    #[serde(default)]
+    pub sensor_id: Option<String>,
+    #[serde(default)]
+    pub sensor_name: Option<String>,
     pub windows: Vec<AccessWindow>,
+}
+
+/// 多约束 Access 的可选条件。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AccessOptions {
+    #[serde(default)]
+    pub min_elevation_deg: Option<f64>,
+    #[serde(default)]
+    pub azimuth_min_deg: Option<f64>,
+    #[serde(default)]
+    pub azimuth_max_deg: Option<f64>,
+    #[serde(default)]
+    pub sensor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CoverageRegion {
+    pub min_latitude_deg: f64,
+    pub max_latitude_deg: f64,
+    pub min_longitude_deg: f64,
+    pub max_longitude_deg: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoveragePoint {
+    pub latitude_deg: f64,
+    pub longitude_deg: f64,
+    pub visible_seconds: f64,
+    pub access_count: u32,
+    pub max_elevation_deg: f64,
+    pub covered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageReport {
+    pub satellite_ids: Vec<String>,
+    pub satellite_names: Vec<String>,
+    pub start: String,
+    pub end: String,
+    pub step_seconds: f64,
+    pub min_elevation_deg: f64,
+    pub region: CoverageRegion,
+    pub grid_step_deg: f64,
+    pub total_points: usize,
+    pub covered_points: usize,
+    pub coverage_ratio: f64,
+    pub average_visible_seconds: f64,
+    pub max_visible_seconds: f64,
+    pub total_visible_seconds: f64,
+    pub points: Vec<CoveragePoint>,
 }
 
 fn format_utc(time: DateTime<Utc>) -> String {
@@ -74,6 +171,14 @@ fn color_of(satellite: &SatelliteObject, index: usize) -> String {
         FALLBACK_COLORS[index % FALLBACK_COLORS.len()].to_string()
     } else {
         satellite.color.clone()
+    }
+}
+
+fn sensor_color(sensor: &SensorObject, index: usize) -> String {
+    if sensor.color.trim().is_empty() {
+        FALLBACK_COLORS[index % FALLBACK_COLORS.len()].to_string()
+    } else {
+        sensor.color.clone()
     }
 }
 
@@ -113,22 +218,35 @@ fn teme_to_ecef(position: [f64; 3], gmst: f64) -> [f64; 3] {
     ]
 }
 
+/// 传播单个时刻并返回地固系位置与速度（km、km/s，速度未扣除地球自转）。
+pub(crate) fn propagate_state(
+    elements: &Elements,
+    constants: &Constants,
+    time: DateTime<Utc>,
+) -> Result<([f64; 3], [f64; 3]), String> {
+    let minutes_since_epoch =
+        (time.naive_utc() - elements.datetime).num_milliseconds() as f64 / 60_000.0;
+    let prediction = constants
+        .propagate(minutes_since_epoch)
+        .map_err(|err| format!("SGP4 传播失败：{err}"))?;
+    let gmst = gmst_radians(time);
+    Ok((
+        teme_to_ecef(prediction.position, gmst),
+        teme_to_ecef(prediction.velocity, gmst),
+    ))
+}
+
 /// 传播单个时刻并返回 TEME→ECEF 后的位置（km）。
 fn propagate_ecef(
     elements: &Elements,
     constants: &Constants,
     time: DateTime<Utc>,
 ) -> Result<[f64; 3], String> {
-    let minutes_since_epoch =
-        (time.naive_utc() - elements.datetime).num_milliseconds() as f64 / 60_000.0;
-    let prediction = constants
-        .propagate(minutes_since_epoch)
-        .map_err(|err| format!("SGP4 传播失败：{err}"))?;
-    Ok(teme_to_ecef(prediction.position, gmst_radians(time)))
+    propagate_state(elements, constants, time).map(|(position, _)| position)
 }
 
 /// ECEF 位置 → [经度(度), 纬度(度), 高度(km)]。
-fn ecef_to_geodetic(position: [f64; 3]) -> Result<[f64; 3], String> {
+pub(crate) fn ecef_to_geodetic(position: [f64; 3]) -> Result<[f64; 3], String> {
     to_coordinates(
         position,
         CoordinateSystem::Geodetic,
@@ -143,30 +261,38 @@ fn ecef_to_geodetic(position: [f64; 3]) -> Result<[f64; 3], String> {
 
 /// 地面站大地坐标 → 地固系位置（km）。
 pub fn station_ecef(station: &GroundStationObject) -> [f64; 3] {
+    geodetic_to_ecef(
+        station.latitude_deg,
+        station.longitude_deg,
+        station.altitude_km,
+    )
+}
+
+pub(crate) fn geodetic_to_ecef(latitude_deg: f64, longitude_deg: f64, altitude_km: f64) -> [f64; 3] {
     let equatorial = EARTH_RADII[0];
     let flattening = (EARTH_RADII[0] - EARTH_RADII[2]) / EARTH_RADII[0];
     let eccentricity_sq = flattening * (2.0 - flattening);
 
-    let latitude = station.latitude_deg.to_radians();
-    let longitude = station.longitude_deg.to_radians();
+    let latitude = latitude_deg.to_radians();
+    let longitude = longitude_deg.to_radians();
     let (sin_lat, cos_lat) = latitude.sin_cos();
     let (sin_lon, cos_lon) = longitude.sin_cos();
 
-    let prime_vertical =
-        equatorial / (1.0 - eccentricity_sq * sin_lat * sin_lat).sqrt();
+    let prime_vertical = equatorial / (1.0 - eccentricity_sq * sin_lat * sin_lat).sqrt();
     [
-        (prime_vertical + station.altitude_km) * cos_lat * cos_lon,
-        (prime_vertical + station.altitude_km) * cos_lat * sin_lon,
-        (prime_vertical * (1.0 - eccentricity_sq) + station.altitude_km) * sin_lat,
+        (prime_vertical + altitude_km) * cos_lat * cos_lon,
+        (prime_vertical + altitude_km) * cos_lat * sin_lon,
+        (prime_vertical * (1.0 - eccentricity_sq) + altitude_km) * sin_lat,
     ]
 }
 
-/// 地固系下计算仰角、方位角与斜距。
-pub fn look_angles(
+fn look_angles_with_basis(
     satellite_ecef: [f64; 3],
-    station: &GroundStationObject,
+    station_position: [f64; 3],
+    up: [f64; 3],
+    east: [f64; 3],
+    north: [f64; 3],
 ) -> (f64, f64, f64) {
-    let station_position = station_ecef(station);
     let range_vector = [
         satellite_ecef[0] - station_position[0],
         satellite_ecef[1] - station_position[1],
@@ -177,19 +303,13 @@ pub fn look_angles(
         + range_vector[2] * range_vector[2])
         .sqrt();
 
-    let latitude = station.latitude_deg.to_radians();
-    let longitude = station.longitude_deg.to_radians();
-    let (sin_lat, cos_lat) = latitude.sin_cos();
-    let (sin_lon, cos_lon) = longitude.sin_cos();
-
-    let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
-    let east = [-sin_lon, cos_lon, 0.0];
-    let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
-
     let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
     let elevation = if range > 0.0 {
-        (dot(range_vector, up) / range).clamp(-1.0, 1.0).asin().to_degrees()
+        (dot(range_vector, up) / range)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .to_degrees()
     } else {
         90.0
     };
@@ -214,6 +334,42 @@ fn sample_count(total_seconds: f64, step_seconds: f64) -> Result<usize, String> 
     Ok(count.max(1))
 }
 
+/// 判断地面站到卫星的视线是否被地球遮挡（椭球解析求交）。
+pub(crate) fn earth_occluded(from: [f64; 3], to: [f64; 3]) -> bool {
+    let a = EARTH_RADII[0];
+    let c = EARTH_RADII[2];
+    let directions = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let scale = [1.0 / (a * a), 1.0 / (a * a), 1.0 / (c * c)];
+
+    let quadratic_a = directions[0] * directions[0] * scale[0]
+        + directions[1] * directions[1] * scale[1]
+        + directions[2] * directions[2] * scale[2];
+    let quadratic_b = 2.0
+        * (from[0] * directions[0] * scale[0]
+            + from[1] * directions[1] * scale[1]
+            + from[2] * directions[2] * scale[2]);
+    let quadratic_c =
+        from[0] * from[0] * scale[0] + from[1] * from[1] * scale[1] + from[2] * from[2] * scale[2]
+            - 1.0;
+
+    let discriminant = quadratic_b * quadratic_b - 4.0 * quadratic_a * quadratic_c;
+    if discriminant <= 1e-12 || quadratic_a <= 0.0 {
+        return false;
+    }
+    let root = discriminant.sqrt();
+    let t1 = (-quadratic_b - root) / (2.0 * quadratic_a);
+    let t2 = (-quadratic_b + root) / (2.0 * quadratic_a);
+    (0.02..0.98).contains(&t1) || (0.02..0.98).contains(&t2)
+}
+
+fn target_ecef(data: &ScenarioData, sensor: &SensorObject) -> Option<[f64; 3]> {
+    if sensor.pointing_mode != "target" {
+        return None;
+    }
+    let station_id = sensor.target_station_id.as_deref()?;
+    data.ground_station(station_id).map(station_ecef)
+}
+
 /// 计算场景内卫星在时间窗口内的地固系轨迹。
 pub fn propagate_scenario(
     data: &ScenarioData,
@@ -229,6 +385,8 @@ pub fn propagate_scenario(
     let count = sample_count(total_seconds, step_seconds)?;
 
     let mut tracks = Vec::new();
+    let mut sensor_tracks = Vec::new();
+
     for (index, satellite) in data.satellites.iter().enumerate() {
         let selected = match satellite_ids {
             Some(ids) => ids.iter().any(|id| id == &satellite.id),
@@ -239,13 +397,23 @@ pub fn propagate_scenario(
         }
 
         let (elements, constants) = prepare(satellite)?;
+        let sensors: Vec<&SensorObject> = data.sensors_of(&satellite.id).collect();
+        let sensor_targets: Vec<Option<[f64; 3]>> = sensors
+            .iter()
+            .map(|sensor| target_ecef(data, sensor))
+            .collect();
+
         let mut samples = Vec::with_capacity(count);
+        let mut sensor_samples: Vec<Vec<SensorSample>> = sensors
+            .iter()
+            .map(|_| Vec::with_capacity(count))
+            .collect();
         let mut previous_longitude: Option<f64> = None;
 
         for sample_index in 0..count {
             let t_seconds = sample_index as f64 * step_seconds;
             let time = start + ChronoDuration::milliseconds((t_seconds * 1000.0).round() as i64);
-            let ecef = propagate_ecef(&elements, &constants, time)?;
+            let (ecef, _) = propagate_state(&elements, &constants, time)?;
             let [mut longitude, latitude, altitude] = ecef_to_geodetic(ecef)?;
 
             // 经度展开，避免 ±180° 跳变导致三维轨迹横穿地球。
@@ -259,11 +427,44 @@ pub fn propagate_scenario(
             }
             previous_longitude = Some(longitude);
 
+            for (sensor_index, sensor) in sensors.iter().enumerate() {
+                if let Some(frame) = sensor::frame_at(
+                    sensor,
+                    ecef,
+                    latitude,
+                    longitude,
+                    sensor_targets[sensor_index],
+                ) {
+                    sensor_samples[sensor_index].push(SensorSample {
+                        t_seconds,
+                        boresight: frame.boresight,
+                        right: frame.right,
+                        up: frame.up,
+                    });
+                }
+            }
+
             samples.push(TrackSample {
                 t_seconds,
                 longitude_deg: longitude,
                 latitude_deg: latitude,
                 altitude_km: altitude,
+            });
+        }
+
+        for (sensor_index, sensor) in sensors.iter().enumerate() {
+            sensor_tracks.push(SensorTrack {
+                sensor_id: sensor.id.clone(),
+                sensor_name: sensor.name.clone(),
+                satellite_id: satellite.id.clone(),
+                color: sensor_color(sensor, index),
+                shape: sensor.shape.clone(),
+                half_angle_deg: sensor.half_angle_deg,
+                horizontal_fov_deg: sensor.horizontal_fov_deg,
+                vertical_fov_deg: sensor.vertical_fov_deg,
+                max_range_km: sensor.max_range_km,
+                pointing_mode: sensor.pointing_mode.clone(),
+                samples: std::mem::take(&mut sensor_samples[sensor_index]),
             });
         }
 
@@ -280,10 +481,101 @@ pub fn propagate_scenario(
         end: format_utc(end),
         step_seconds,
         satellites: tracks,
+        sensor_tracks,
     })
 }
 
-/// 计算卫星与地面站在时间窗口内的 Access 窗口。
+#[derive(Debug, Clone, Copy)]
+struct ConstraintSample {
+    ok: bool,
+    elevation_deg: f64,
+}
+
+struct AccessContext<'a> {
+    elements: &'a Elements,
+    constants: &'a Constants<'a>,
+    start: DateTime<Utc>,
+    station_position: [f64; 3],
+    up: [f64; 3],
+    east: [f64; 3],
+    north: [f64; 3],
+    min_elevation: f64,
+    azimuth_range: Option<(f64, f64)>,
+    sensor: Option<&'a SensorObject>,
+    sensor_target: Option<[f64; 3]>,
+}
+
+impl AccessContext<'_> {
+    fn evaluate(&self, t_seconds: f64) -> Result<ConstraintSample, String> {
+        let time =
+            self.start + ChronoDuration::milliseconds((t_seconds * 1000.0).round() as i64);
+        let (ecef, _) = propagate_state(self.elements, self.constants, time)?;
+        let (elevation, azimuth, _) = look_angles_with_basis(
+            ecef,
+            self.station_position,
+            self.up,
+            self.east,
+            self.north,
+        );
+
+        let mut ok = elevation >= self.min_elevation;
+        if ok {
+            ok = !earth_occluded(self.station_position, ecef);
+        }
+        if ok {
+            if let Some((minimum, maximum)) = self.azimuth_range {
+                ok = az_in_range(azimuth, minimum, maximum);
+            }
+        }
+        if ok {
+            if let Some(sensor) = self.sensor {
+                ok = match ecef_to_geodetic(ecef) {
+                    Ok([longitude, latitude, _]) => sensor::frame_at(
+                        sensor,
+                        ecef,
+                        latitude,
+                        longitude,
+                        self.sensor_target,
+                    )
+                    .map(|frame| sensor::sees(sensor, &frame, ecef, self.station_position))
+                    .unwrap_or(false),
+                    Err(_) => false,
+                };
+            }
+        }
+
+        Ok(ConstraintSample {
+            ok,
+            elevation_deg: elevation,
+        })
+    }
+}
+
+fn az_in_range(value: f64, minimum: f64, maximum: f64) -> bool {
+    if minimum <= maximum {
+        value >= minimum && value <= maximum
+    } else {
+        value >= minimum || value <= maximum
+    }
+}
+
+/// 在状态发生变化的时间区间内二分细化边界，避免固定步长带来的边界误差。
+fn refine_boundary<F>(mut low: f64, mut high: f64, ok_low: bool, mut evaluate: F) -> Result<f64, String>
+where
+    F: FnMut(f64) -> Result<ConstraintSample, String>,
+{
+    for _ in 0..28 {
+        let middle = (low + high) / 2.0;
+        if evaluate(middle)?.ok == ok_low {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Ok((low + high) / 2.0)
+}
+
+/// 计算卫星与地面站在时间窗口内的多约束 Access 窗口。
 pub fn compute_access(
     data: &ScenarioData,
     satellite_id: &str,
@@ -291,7 +583,7 @@ pub fn compute_access(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     step_seconds: f64,
-    min_elevation_override: Option<f64>,
+    options: &AccessOptions,
 ) -> Result<AccessReport, String> {
     let satellite = data
         .satellite(satellite_id)
@@ -300,10 +592,44 @@ pub fn compute_access(
         .ground_station(ground_station_id)
         .ok_or_else(|| format!("场景中不存在地面站 {ground_station_id}"))?;
 
-    let min_elevation = min_elevation_override.unwrap_or(station.min_elevation_deg);
+    let min_elevation = options
+        .min_elevation_deg
+        .unwrap_or(station.min_elevation_deg);
     if !min_elevation.is_finite() || !(0.0..=90.0).contains(&min_elevation) {
         return Err("最小仰角需在 [0, 90] 度内".into());
     }
+
+    let azimuth_range = match (options.azimuth_min_deg, options.azimuth_max_deg) {
+        (Some(minimum), Some(maximum)) => {
+            if !minimum.is_finite()
+                || !maximum.is_finite()
+                || !(0.0..=360.0).contains(&minimum)
+                || !(0.0..=360.0).contains(&maximum)
+                || (minimum - maximum).abs() < 1e-9
+            {
+                return Err("方位角范围需为 [0, 360] 度内的两个不同值".into());
+            }
+            Some((minimum, maximum))
+        }
+        (None, None) => None,
+        _ => return Err("方位角范围需同时填写上下限".into()),
+    };
+
+    let sensor = match options.sensor_id.as_deref() {
+        Some(id) => {
+            let sensor = data
+                .sensor(id)
+                .ok_or_else(|| format!("场景中不存在传感器 {id}"))?;
+            if sensor.satellite_id != satellite.id {
+                return Err("所选传感器未绑定到该卫星".into());
+            }
+            if !sensor.enabled {
+                return Err("所选传感器未启用".into());
+            }
+            Some(sensor)
+        }
+        None => None,
+    };
 
     let total_seconds = (end - start).num_milliseconds() as f64 / 1000.0;
     if total_seconds <= 0.0 {
@@ -313,6 +639,37 @@ pub fn compute_access(
 
     let (elements, constants) = prepare(satellite)?;
 
+    let station_position = station_ecef(station);
+    let latitude = station.latitude_deg.to_radians();
+    let longitude = station.longitude_deg.to_radians();
+    let (sin_lat, cos_lat) = latitude.sin_cos();
+    let (sin_lon, cos_lon) = longitude.sin_cos();
+
+    let mut constraints = vec![
+        CONSTRAINT_ELEVATION.to_string(),
+        CONSTRAINT_OCCLUSION.to_string(),
+    ];
+    if azimuth_range.is_some() {
+        constraints.push(CONSTRAINT_AZIMUTH.to_string());
+    }
+    if sensor.is_some() {
+        constraints.push(CONSTRAINT_SENSOR.to_string());
+    }
+
+    let context = AccessContext {
+        elements: &elements,
+        constants: &constants,
+        start,
+        station_position,
+        up: [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat],
+        east: [-sin_lon, cos_lon, 0.0],
+        north: [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat],
+        min_elevation,
+        azimuth_range,
+        sensor,
+        sensor_target: sensor.and_then(|item| target_ecef(data, item)),
+    };
+
     struct ActiveWindow {
         start_seconds: f64,
         max_elevation_deg: f64,
@@ -320,17 +677,12 @@ pub fn compute_access(
 
     let mut windows = Vec::new();
     let mut active: Option<ActiveWindow> = None;
-    let mut previous: Option<(f64, f64)> = None;
+    let mut previous: Option<(f64, ConstraintSample)> = None;
 
-    let crossing = |t0: f64, e0: f64, t1: f64, e1: f64| -> f64 {
-        if (e1 - e0).abs() < 1e-9 {
-            return t1;
-        }
-        let fraction = ((min_elevation - e0) / (e1 - e0)).clamp(0.0, 1.0);
-        t0 + (t1 - t0) * fraction
-    };
-
-    let push_window = |start_seconds: f64, end_seconds: f64, max_elevation_deg: f64, windows: &mut Vec<AccessWindow>| {
+    let push_window = |start_seconds: f64,
+                       end_seconds: f64,
+                       max_elevation_deg: f64,
+                       windows: &mut Vec<AccessWindow>| {
         let end_seconds = end_seconds.max(start_seconds);
         let index = windows.len() as u32 + 1;
         windows.push(AccessWindow {
@@ -345,41 +697,42 @@ pub fn compute_access(
             end_seconds,
             duration_seconds: end_seconds - start_seconds,
             max_elevation_deg,
+            constraints: constraints.clone(),
         });
     };
 
     for sample_index in 0..count {
         let t_seconds = sample_index as f64 * step_seconds;
-        let time = start + ChronoDuration::milliseconds((t_seconds * 1000.0).round() as i64);
-        let ecef = propagate_ecef(&elements, &constants, time)?;
-        let (elevation, _, _) = look_angles(ecef, station);
+        let current = context.evaluate(t_seconds)?;
 
-        if elevation >= min_elevation {
+        if current.ok {
             match active.as_mut() {
                 Some(window) => {
-                    if elevation > window.max_elevation_deg {
-                        window.max_elevation_deg = elevation;
+                    if current.elevation_deg > window.max_elevation_deg {
+                        window.max_elevation_deg = current.elevation_deg;
                     }
                 }
                 None => {
                     let start_seconds = match previous {
-                        Some((previous_t, previous_elevation)) => {
-                            crossing(previous_t, previous_elevation, t_seconds, elevation)
+                        Some((previous_t, previous_sample)) if !previous_sample.ok => {
+                            refine_boundary(previous_t, t_seconds, false, |time| {
+                                context.evaluate(time)
+                            })?
                         }
-                        None => t_seconds,
+                        _ => t_seconds,
                     };
                     active = Some(ActiveWindow {
                         start_seconds,
-                        max_elevation_deg: elevation,
+                        max_elevation_deg: current.elevation_deg,
                     });
                 }
             }
         } else if let Some(window) = active.take() {
             let end_seconds = match previous {
-                Some((previous_t, previous_elevation)) => {
-                    crossing(previous_t, previous_elevation, t_seconds, elevation)
+                Some((previous_t, previous_sample)) if previous_sample.ok => {
+                    refine_boundary(previous_t, t_seconds, true, |time| context.evaluate(time))?
                 }
-                None => t_seconds,
+                _ => t_seconds,
             };
             push_window(
                 window.start_seconds,
@@ -389,7 +742,7 @@ pub fn compute_access(
             );
         }
 
-        previous = Some((t_seconds, elevation));
+        previous = Some((t_seconds, current));
     }
 
     if let Some(window) = active.take() {
@@ -419,6 +772,232 @@ pub fn compute_access(
         window_count: windows.len() as u32,
         total_duration_seconds: total_duration,
         longest_window_seconds: longest,
+        constraints,
+        azimuth_min_deg: azimuth_range.map(|(minimum, _)| minimum),
+        azimuth_max_deg: azimuth_range.map(|(_, maximum)| maximum),
+        sensor_id: sensor.map(|item| item.id.clone()),
+        sensor_name: sensor.map(|item| item.name.clone()),
         windows,
     })
+}
+
+/// 区域网格覆盖计算：统计每个网格点对选中卫星的可见时长与覆盖次数。
+#[allow(clippy::too_many_arguments)]
+pub fn compute_coverage(
+    data: &ScenarioData,
+    satellite_ids: Option<&[String]>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    step_seconds: f64,
+    region: CoverageRegion,
+    grid_step_deg: f64,
+    min_elevation_deg: f64,
+) -> Result<CoverageReport, String> {
+    if !region.min_latitude_deg.is_finite()
+        || !region.max_latitude_deg.is_finite()
+        || !region.min_longitude_deg.is_finite()
+        || !region.max_longitude_deg.is_finite()
+        || !(-90.0..=90.0).contains(&region.min_latitude_deg)
+        || !(-90.0..=90.0).contains(&region.max_latitude_deg)
+        || !(-180.0..=180.0).contains(&region.min_longitude_deg)
+        || !(-180.0..=180.0).contains(&region.max_longitude_deg)
+        || region.min_latitude_deg >= region.max_latitude_deg
+        || region.min_longitude_deg >= region.max_longitude_deg
+    {
+        return Err("覆盖区域需为合法的经纬度范围（最小值必须小于最大值）".into());
+    }
+    if !grid_step_deg.is_finite() || !(0.1..=30.0).contains(&grid_step_deg) {
+        return Err("网格步长需在 [0.1, 30] 度内".into());
+    }
+    if !min_elevation_deg.is_finite() || !(0.0..=90.0).contains(&min_elevation_deg) {
+        return Err("最小仰角需在 [0, 90] 度内".into());
+    }
+
+    let total_seconds = (end - start).num_milliseconds() as f64 / 1000.0;
+    if total_seconds <= 0.0 {
+        return Err("结束时间必须晚于开始时间".into());
+    }
+    let sample_count = sample_count(total_seconds, step_seconds)?;
+
+    let latitude_steps = ((region.max_latitude_deg - region.min_latitude_deg) / grid_step_deg).ceil()
+        as usize;
+    let longitude_steps =
+        ((region.max_longitude_deg - region.min_longitude_deg) / grid_step_deg).ceil() as usize;
+    let point_count = (latitude_steps + 1) * (longitude_steps + 1);
+    if point_count > MAX_COVERAGE_POINTS {
+        return Err(format!(
+            "网格点数为 {point_count}，超过上限 {MAX_COVERAGE_POINTS}，请增大网格步长或缩小区域"
+        ));
+    }
+
+    let mut satellites = Vec::new();
+    for satellite in &data.satellites {
+        let selected = match satellite_ids {
+            Some(ids) => ids.iter().any(|id| id == &satellite.id),
+            None => satellite.enabled,
+        };
+        if selected {
+            satellites.push(satellite);
+        }
+    }
+    if satellites.is_empty() {
+        return Err("请至少选择一颗卫星".into());
+    }
+
+    // 每颗卫星只传播一次，后续按网格点复用位置序列。
+    let mut positions: Vec<Vec<[f64; 3]>> = Vec::with_capacity(satellites.len());
+    for satellite in &satellites {
+        let (elements, constants) = prepare(satellite)?;
+        let mut series = Vec::with_capacity(sample_count);
+        for sample_index in 0..sample_count {
+            let t_seconds = sample_index as f64 * step_seconds;
+            let time =
+                start + ChronoDuration::milliseconds((t_seconds * 1000.0).round() as i64);
+            series.push(propagate_ecef(&elements, &constants, time)?);
+        }
+        positions.push(series);
+    }
+
+    let mut points = Vec::with_capacity(point_count);
+    let mut covered_points = 0usize;
+    let mut total_visible = 0.0_f64;
+    let mut max_visible = 0.0_f64;
+
+    for lat_index in 0..=latitude_steps {
+        let latitude_deg = (region.min_latitude_deg + lat_index as f64 * grid_step_deg)
+            .min(region.max_latitude_deg);
+        for lon_index in 0..=longitude_steps {
+            let longitude_deg = (region.min_longitude_deg + lon_index as f64 * grid_step_deg)
+                .min(region.max_longitude_deg);
+
+            let station_position = geodetic_to_ecef(latitude_deg, longitude_deg, 0.0);
+            let latitude = latitude_deg.to_radians();
+            let longitude = longitude_deg.to_radians();
+            let (sin_lat, cos_lat) = latitude.sin_cos();
+            let (sin_lon, cos_lon) = longitude.sin_cos();
+            let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
+            let east = [-sin_lon, cos_lon, 0.0];
+            let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
+
+            let mut visible_seconds = 0.0_f64;
+            let mut access_count = 0u32;
+            let mut point_max_elevation = f64::NEG_INFINITY;
+
+            for series in &positions {
+                let mut previous_visible: Option<bool> = None;
+                let mut previous_elevation = 0.0_f64;
+                for satellite_position in series.iter() {
+                    let (elevation, _, _) = look_angles_with_basis(
+                        *satellite_position,
+                        station_position,
+                        up,
+                        east,
+                        north,
+                    );
+                    if elevation > point_max_elevation {
+                        point_max_elevation = elevation;
+                    }
+                    let visible = elevation >= min_elevation_deg
+                        && !earth_occluded(station_position, *satellite_position);
+
+                    if let Some(was_visible) = previous_visible {
+                        if visible != was_visible {
+                            let denominator = elevation - previous_elevation;
+                            let fraction = if denominator.abs() > 1e-9 {
+                                ((min_elevation_deg - previous_elevation) / denominator)
+                                    .clamp(0.0, 1.0)
+                            } else {
+                                0.5
+                            };
+                            if visible {
+                                visible_seconds += fraction * step_seconds;
+                            } else {
+                                visible_seconds += (1.0 - fraction) * step_seconds;
+                            }
+                        } else if visible {
+                            visible_seconds += step_seconds;
+                        }
+                    }
+                    if visible && previous_visible != Some(true) {
+                        access_count += 1;
+                    }
+                    previous_visible = Some(visible);
+                    previous_elevation = elevation;
+                }
+            }
+
+            if !point_max_elevation.is_finite() {
+                point_max_elevation = 0.0;
+            }
+            let covered = visible_seconds > 0.0;
+            if covered {
+                covered_points += 1;
+                total_visible += visible_seconds;
+                max_visible = max_visible.max(visible_seconds);
+            }
+
+            points.push(CoveragePoint {
+                latitude_deg,
+                longitude_deg,
+                visible_seconds,
+                access_count,
+                max_elevation_deg: point_max_elevation,
+                covered,
+            });
+        }
+    }
+
+    let coverage_ratio = if points.is_empty() {
+        0.0
+    } else {
+        covered_points as f64 / points.len() as f64
+    };
+    let average_visible_seconds = if covered_points == 0 {
+        0.0
+    } else {
+        total_visible / covered_points as f64
+    };
+
+    Ok(CoverageReport {
+        satellite_ids: satellites.iter().map(|item| item.id.clone()).collect(),
+        satellite_names: satellites.iter().map(|item| item.name.clone()).collect(),
+        start: format_utc(start),
+        end: format_utc(end),
+        step_seconds,
+        min_elevation_deg,
+        region,
+        grid_step_deg,
+        total_points: points.len(),
+        covered_points,
+        coverage_ratio,
+        average_visible_seconds,
+        max_visible_seconds: max_visible,
+        total_visible_seconds: total_visible,
+        points,
+    })
+}
+
+/// 供环境模型使用：按时间均匀采样卫星的地固系位置、速度与大地坐标。
+pub(crate) fn sample_states(
+    satellite: &SatelliteObject,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    step_seconds: f64,
+) -> Result<Vec<(f64, [f64; 3], [f64; 3], [f64; 3])>, String> {
+    let total_seconds = (end - start).num_milliseconds() as f64 / 1000.0;
+    if total_seconds <= 0.0 {
+        return Err("结束时间必须晚于开始时间".into());
+    }
+    let count = sample_count(total_seconds, step_seconds)?;
+    let (elements, constants) = prepare(satellite)?;
+
+    let mut states = Vec::with_capacity(count);
+    for sample_index in 0..count {
+        let t_seconds = sample_index as f64 * step_seconds;
+        let time = start + ChronoDuration::milliseconds((t_seconds * 1000.0).round() as i64);
+        let (position, velocity) = propagate_state(&elements, &constants, time)?;
+        let geodetic = ecef_to_geodetic(position)?;
+        states.push((t_seconds, position, velocity, geodetic));
+    }
+    Ok(states)
 }

@@ -12,8 +12,9 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
+    environment::{self, EnvironmentOptions, EnvironmentReport},
     error::AppError,
-    orbit::{self, AccessReport},
+    orbit::{self, AccessOptions, AccessReport, CoverageRegion, CoverageReport},
     scenario::ScenarioData,
     state::AppState,
 };
@@ -107,10 +108,61 @@ struct AccessParams {
     step_seconds: f64,
     #[serde(default)]
     min_elevation_deg: Option<f64>,
+    #[serde(default)]
+    azimuth_min_deg: Option<f64>,
+    #[serde(default)]
+    azimuth_max_deg: Option<f64>,
+    #[serde(default)]
+    sensor_id: Option<String>,
+}
+
+impl AccessParams {
+    fn options(&self) -> AccessOptions {
+        AccessOptions {
+            min_elevation_deg: self.min_elevation_deg,
+            azimuth_min_deg: self.azimuth_min_deg,
+            azimuth_max_deg: self.azimuth_max_deg,
+            sensor_id: self.sensor_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CoverageParams {
+    #[serde(default)]
+    satellite_ids: Option<Vec<String>>,
+    start: String,
+    end: String,
+    #[serde(default = "default_step")]
+    step_seconds: f64,
+    region: CoverageRegion,
+    #[serde(default = "default_grid_step")]
+    grid_step_deg: f64,
+    #[serde(default = "default_min_elevation")]
+    min_elevation_deg: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EnvironmentParams {
+    satellite_id: String,
+    start: String,
+    end: String,
+    #[serde(default = "default_step")]
+    step_seconds: f64,
+    #[serde(default)]
+    options: EnvironmentOptions,
 }
 
 fn default_step() -> f64 {
     30.0
+}
+
+fn default_grid_step() -> f64 {
+    2.0
+}
+
+fn default_min_elevation() -> f64 {
+    5.0
 }
 
 fn parse_time(raw: &str, label: &str) -> Result<DateTime<Utc>, AppError> {
@@ -154,6 +206,43 @@ fn validate_params(kind: &str, params: &Value) -> Result<(), AppError> {
             if params.satellite_id.trim().is_empty() || params.ground_station_id.trim().is_empty() {
                 return Err(AppError::BadRequest("请选择卫星与地面站".into()));
             }
+            match (params.azimuth_min_deg, params.azimuth_max_deg) {
+                (Some(minimum), Some(maximum)) => {
+                    if !(0.0..=360.0).contains(&minimum)
+                        || !(0.0..=360.0).contains(&maximum)
+                        || (minimum - maximum).abs() < 1e-9
+                    {
+                        return Err(AppError::BadRequest(
+                            "方位角范围需为 [0, 360] 度内的两个不同值".into(),
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(AppError::BadRequest("方位角范围需同时填写上下限".into())),
+            }
+            let start = parse_time(&params.start, "start")?;
+            let end = parse_time(&params.end, "end")?;
+            validate_window(start, end, params.step_seconds)
+        }
+        "coverage" => {
+            let params: CoverageParams = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("覆盖参数无效：{err}")))?;
+            if !(0.1..=30.0).contains(&params.grid_step_deg) {
+                return Err(AppError::BadRequest("网格步长需在 [0.1, 30] 度内".into()));
+            }
+            if !(0.0..=90.0).contains(&params.min_elevation_deg) {
+                return Err(AppError::BadRequest("最小仰角需在 [0, 90] 度内".into()));
+            }
+            let start = parse_time(&params.start, "start")?;
+            let end = parse_time(&params.end, "end")?;
+            validate_window(start, end, params.step_seconds)
+        }
+        "environment" => {
+            let params: EnvironmentParams = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("环境参数无效：{err}")))?;
+            if params.satellite_id.trim().is_empty() {
+                return Err(AppError::BadRequest("请选择卫星".into()));
+            }
             let start = parse_time(&params.start, "start")?;
             let end = parse_time(&params.end, "end")?;
             validate_window(start, end, params.step_seconds)
@@ -162,7 +251,11 @@ fn validate_params(kind: &str, params: &Value) -> Result<(), AppError> {
     }
 }
 
-async fn scenario_exists(state: &AppState, user: &AuthUser, scenario_id: Uuid) -> Result<bool, AppError> {
+async fn scenario_exists(
+    state: &AppState,
+    user: &AuthUser,
+    scenario_id: Uuid,
+) -> Result<bool, AppError> {
     let exists: Option<Uuid> = sqlx::query_scalar(&format!(
         "SELECT id FROM scenarios WHERE id = $3 AND {SCOPE}"
     ))
@@ -270,19 +363,32 @@ async fn job_csv(
     .await?;
 
     let row = row.ok_or(AppError::NotFound("任务不存在"))?;
-    if row.kind != "access" {
-        return Err(AppError::BadRequest("仅 Access 任务支持 CSV 导出".into()));
-    }
     if row.status != "succeeded" {
         return Err(AppError::BadRequest("任务尚未完成，无法导出".into()));
     }
     let result = row
         .result
         .ok_or(AppError::BadRequest("任务没有结果".into()))?;
-    let report: AccessReport = serde_json::from_value(result)
-        .map_err(|err| AppError::Internal(format!("Access 结果解析失败：{err}")))?;
 
-    let csv = access_csv(&report);
+    let (csv, filename) = match row.kind.as_str() {
+        "access" => {
+            let report: AccessReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("Access 结果解析失败：{err}")))?;
+            (access_csv(&report), format!("access-{id}.csv"))
+        }
+        "coverage" => {
+            let report: CoverageReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("覆盖结果解析失败：{err}")))?;
+            (coverage_csv(&report), format!("coverage-{id}.csv"))
+        }
+        "environment" => {
+            let report: EnvironmentReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("环境结果解析失败：{err}")))?;
+            (environment_csv(&report), format!("environment-{id}.csv"))
+        }
+        _ => return Err(AppError::BadRequest("该任务类型不支持 CSV 导出".into())),
+    };
+
     Ok((
         [
             (
@@ -291,7 +397,7 @@ async fn job_csv(
             ),
             (
                 header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"access-{id}.csv\""),
+                format!("attachment; filename=\"{filename}\""),
             ),
         ],
         csv,
@@ -301,19 +407,58 @@ async fn job_csv(
 
 fn access_csv(report: &AccessReport) -> String {
     let mut output = String::from(
-        "\u{feff}window,satellite,ground_station,min_elevation_deg,start_utc,end_utc,duration_seconds,max_elevation_deg\n",
+        "\u{feff}window,satellite,ground_station,constraints,sensor,min_elevation_deg,start_utc,end_utc,duration_seconds,max_elevation_deg\n",
     );
     for window in &report.windows {
         output.push_str(&format!(
-            "{},{},{},{:.2},{},{},{:.1},{:.3}\n",
+            "{},{},{},{},{},{:.2},{},{},{:.1},{:.3}\n",
             window.index,
             csv_field(&report.satellite_name),
             csv_field(&report.ground_station_name),
+            csv_field(&window.constraints.join("|")),
+            csv_field(report.sensor_name.as_deref().unwrap_or("")),
             report.min_elevation_deg,
             window.start_utc,
             window.end_utc,
             window.duration_seconds,
             window.max_elevation_deg
+        ));
+    }
+    output
+}
+
+fn coverage_csv(report: &CoverageReport) -> String {
+    let mut output = String::from(
+        "\u{feff}latitude_deg,longitude_deg,visible_seconds,access_count,max_elevation_deg,covered\n",
+    );
+    for point in &report.points {
+        output.push_str(&format!(
+            "{:.4},{:.4},{:.1},{},{:.3},{}\n",
+            point.latitude_deg,
+            point.longitude_deg,
+            point.visible_seconds,
+            point.access_count,
+            point.max_elevation_deg,
+            if point.covered { 1 } else { 0 }
+        ));
+    }
+    output
+}
+
+fn environment_csv(report: &EnvironmentReport) -> String {
+    let mut output = String::from(
+        "\u{feff}t_seconds,altitude_km,corrected_altitude_km,density_kg_m3,temperature_k,drag_accel_m_s2,cumulative_delta_v_m_s\n",
+    );
+    for sample in &report.samples {
+        output.push_str(&format!(
+            "{:.1},{:.3},{:.3},{:.6e},{:.2},{:.6e},{:.3}\n",
+            sample.t_seconds,
+            sample.altitude_km,
+            sample.corrected_altitude_km,
+            sample.density_kg_m3,
+            sample.temperature_k,
+            sample.drag_accel_m_s2,
+            sample.cumulative_delta_v_m_s
         ));
     }
     output
@@ -417,7 +562,41 @@ fn compute_job_result(kind: &str, params: &Value, scenario: &ScenarioData) -> Re
                 start,
                 end,
                 params.step_seconds,
+                &params.options(),
+            )?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "coverage" => {
+            let params: CoverageParams = serde_json::from_value(params.clone())
+                .map_err(|err| format!("覆盖参数无效：{err}"))?;
+            let start = parse_time(&params.start, "start").map_err(|err| err.to_string())?;
+            let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
+            let report = orbit::compute_coverage(
+                scenario,
+                params.satellite_ids.as_deref(),
+                start,
+                end,
+                params.step_seconds,
+                params.region,
+                params.grid_step_deg,
                 params.min_elevation_deg,
+            )?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "environment" => {
+            let params: EnvironmentParams = serde_json::from_value(params.clone())
+                .map_err(|err| format!("环境参数无效：{err}"))?;
+            let satellite = scenario
+                .satellite(&params.satellite_id)
+                .ok_or_else(|| format!("场景中不存在卫星 {}", params.satellite_id))?;
+            let start = parse_time(&params.start, "start").map_err(|err| err.to_string())?;
+            let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
+            let report = environment::analyze_environment(
+                satellite,
+                start,
+                end,
+                params.step_seconds,
+                &params.options,
             )?;
             serde_json::to_value(report).map_err(|err| err.to_string())
         }
