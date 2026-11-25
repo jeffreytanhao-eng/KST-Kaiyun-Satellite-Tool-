@@ -1,11 +1,20 @@
 :root {
   color-scheme: dark;
-  --kst-bg: #070b14;
-  --kst-panel: #0f1726;
-  --kst-border: #1d2a3f;
-  --kst-text: #d7e2f0;
-  --kst-text-dim: #7f90a8;
-  --kst-accent: #2f9bff;
+  --kst-bg: #07090c;
+  --kst-panel: #0f1318;
+  --kst-border: #1e2630;
+  --kst-text: #c8d0da;
+  --kst-text-dim: #7a8696;
+  --kst-accent: #4a7d9a;
+  --kst-accent-strong: #5b9bb8;
+
+  --el-color-primary: #4a7d9a;
+  --el-color-primary-light-3: #5b9bb8;
+  --el-bg-color: #0f1318;
+  --el-bg-color-overlay: #12171d;
+  --el-fill-color-blank: #0f1318;
+  --el-border-color: #1e2630;
+  --el-border-color-light: #1e2630;
 }
 
 * {
@@ -22,5 +31,5 @@ body,
 body {
   background: var(--kst-bg);
   color: var(--kst-text);
-  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-family: 'HarmonyOS Sans SC', 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
 }

@@ -1,21 +1,20 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import * as Cesium from 'cesium'
-import 'cesium/Build/Cesium/Widgets/widgets.css'
 
+import LangSwitch from '@/components/LangSwitch.vue'
 import { computeState, type StateResult } from '@/api/compute'
+import { useCesiumViewer } from '@/composables/useCesiumViewer'
 import { useAuthStore } from '@/stores/auth'
+import { useI18n } from '@/i18n'
 
 const router = useRouter()
 const auth = useAuthStore()
-
-const productName = 'KST · Kaiyun Satellite Tool'
-const phaseLabel = 'Phase 0 · 基础打通'
+const { t } = useI18n()
 
 const viewerHost = ref<HTMLDivElement | null>(null)
-const viewer = shallowRef<Cesium.Viewer | null>(null)
+const { init, renderState } = useCesiumViewer(viewerHost)
 const computing = ref(false)
 const result = ref<StateResult | null>(null)
 
@@ -28,96 +27,6 @@ const form = reactive({
   argPerigeeDeg: 0,
   trueAnomalyDeg: 0
 })
-
-function initViewer() {
-  if (!viewerHost.value) return
-
-  const instance = new Cesium.Viewer(viewerHost.value, {
-    baseLayer: false,
-    animation: false,
-    timeline: false,
-    baseLayerPicker: false,
-    fullscreenButton: false,
-    geocoder: false,
-    homeButton: false,
-    infoBox: false,
-    navigationHelpButton: false,
-    sceneModePicker: false,
-    selectionIndicator: false,
-    creditContainer: document.createElement('div')
-  })
-
-  instance.scene.backgroundColor = Cesium.Color.fromCssColorString('#05080f')
-  instance.scene.globe.baseColor = Cesium.Color.fromCssColorString('#0b1728')
-  instance.scene.globe.showGroundAtmosphere = true
-  instance.scene.screenSpaceCameraController.enableCollisionDetection = false
-  instance.imageryLayers.addImageryProvider(
-    new Cesium.GridImageryProvider({
-      cells: 4,
-      color: Cesium.Color.fromCssColorString('#1b3358'),
-      glowColor: Cesium.Color.fromCssColorString('#0f2237'),
-      backgroundColor: Cesium.Color.TRANSPARENT
-    })
-  )
-  instance.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(110, 25, 24_000_000)
-  })
-
-  viewer.value = instance
-}
-
-function renderResult(data: StateResult) {
-  const instance = viewer.value
-  if (!instance) return
-
-  instance.entities.removeAll()
-  instance.entities.add({
-    position: Cesium.Cartesian3.fromDegrees(
-      data.longitude_deg,
-      data.latitude_deg,
-      data.altitude_km * 1000
-    ),
-    point: {
-      pixelSize: 10,
-      color: Cesium.Color.fromCssColorString('#4fc3f7'),
-      outlineColor: Cesium.Color.WHITE,
-      outlineWidth: 2,
-      disableDepthTestDistance: Number.POSITIVE_INFINITY
-    },
-    label: {
-      text: 'KST-SAT-01',
-      font: '12px "Segoe UI", sans-serif',
-      fillColor: Cesium.Color.WHITE,
-      pixelOffset: new Cesium.Cartesian2(0, -20),
-      disableDepthTestDistance: Number.POSITIVE_INFINITY
-    }
-  })
-
-  if (data.orbit_track.length > 1) {
-    const flat = data.orbit_track.flatMap(([longitude, latitude, altitude]) => [
-      longitude,
-      latitude,
-      altitude * 1000
-    ])
-    instance.entities.add({
-      polyline: {
-        positions: Cesium.Cartesian3.fromDegreesArrayHeights(flat),
-        width: 2,
-        arcType: Cesium.ArcType.NONE,
-        material: Cesium.Color.fromCssColorString('#2f9bff').withAlpha(0.85)
-      }
-    })
-  }
-
-  instance.camera.flyTo({
-    destination: Cesium.Cartesian3.fromDegrees(
-      data.longitude_deg,
-      data.latitude_deg,
-      16_000_000
-    ),
-    duration: 1.2
-  })
-}
 
 async function runCompute() {
   computing.value = true
@@ -135,9 +44,9 @@ async function runCompute() {
       }
     })
     result.value = data
-    renderResult(data)
+    renderState(data)
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '计算失败')
+    ElMessage.error(error instanceof Error ? error.message : t('computeFailed'))
   } finally {
     computing.value = false
   }
@@ -152,32 +61,28 @@ async function onLogout() {
   await router.replace({ name: 'login' })
 }
 
-onMounted(() => {
-  initViewer()
-  void runCompute()
-})
-
-onBeforeUnmount(() => {
-  viewer.value?.destroy()
-  viewer.value = null
+onMounted(async () => {
+  await init()
+  await runCompute()
 })
 </script>
 
 <template>
   <div class="shell">
     <header class="header">
-      <span class="product">{{ productName }}</span>
-      <el-tag size="small" effect="dark" type="info">{{ phaseLabel }}</el-tag>
+      <span class="product">{{ t('appTitle') }}</span>
+      <el-tag size="small" effect="dark" type="info" class="phase">{{ t('phaseLabel') }}</el-tag>
       <span class="spacer" />
-      <span class="user">{{ auth.user?.username ?? '未知用户' }}</span>
-      <el-button link type="primary" @click="onLogout">退出登录</el-button>
+      <LangSwitch />
+      <span class="user">{{ auth.user?.username ?? t('unknownUser') }}</span>
+      <el-button link type="primary" @click="onLogout">{{ t('logout') }}</el-button>
     </header>
 
     <main class="workspace">
       <aside class="panel panel-left">
-        <div class="panel-title">轨道参数</div>
+        <div class="panel-title">{{ t('orbitParams') }}</div>
         <el-form label-position="top" size="small" class="form">
-          <el-form-item label="时刻（UTC）">
+          <el-form-item :label="t('epochUtc')">
             <el-date-picker
               v-model="form.epoch"
               type="datetime"
@@ -185,7 +90,7 @@ onBeforeUnmount(() => {
               style="width: 100%"
             />
           </el-form-item>
-          <el-form-item label="半长轴 a（km）">
+          <el-form-item :label="t('semiMajorAxis')">
             <el-input-number
               v-model="form.semiMajorAxisKm"
               :min="6400"
@@ -195,7 +100,7 @@ onBeforeUnmount(() => {
               style="width: 100%"
             />
           </el-form-item>
-          <el-form-item label="偏心率 e">
+          <el-form-item :label="t('eccentricity')">
             <el-input-number
               v-model="form.eccentricity"
               :min="0"
@@ -206,7 +111,7 @@ onBeforeUnmount(() => {
               style="width: 100%"
             />
           </el-form-item>
-          <el-form-item label="倾角 i（°）">
+          <el-form-item :label="t('inclination')">
             <el-input-number
               v-model="form.inclinationDeg"
               :min="0"
@@ -217,7 +122,7 @@ onBeforeUnmount(() => {
               style="width: 100%"
             />
           </el-form-item>
-          <el-form-item label="升交点赤经 Ω（°）">
+          <el-form-item :label="t('raan')">
             <el-input-number
               v-model="form.raanDeg"
               :min="0"
@@ -228,7 +133,7 @@ onBeforeUnmount(() => {
               style="width: 100%"
             />
           </el-form-item>
-          <el-form-item label="近地点幅角 ω（°）">
+          <el-form-item :label="t('argPerigee')">
             <el-input-number
               v-model="form.argPerigeeDeg"
               :min="0"
@@ -239,7 +144,7 @@ onBeforeUnmount(() => {
               style="width: 100%"
             />
           </el-form-item>
-          <el-form-item label="真近点角 ν（°）">
+          <el-form-item :label="t('trueAnomaly')">
             <el-input-number
               v-model="form.trueAnomalyDeg"
               :min="0"
@@ -252,35 +157,33 @@ onBeforeUnmount(() => {
           </el-form-item>
         </el-form>
         <el-button type="primary" class="run" :loading="computing" @click="runCompute">
-          计算并显示
+          {{ t('compute') }}
         </el-button>
-        <p class="panel-note">
-          时间转换、开普勒递推与 J2000→地固系旋转均由 Rust 后端完成，前端仅负责展示。
-        </p>
+        <p class="panel-note">{{ t('computeNote') }}</p>
       </aside>
 
       <section class="viewport">
         <div ref="viewerHost" class="cesium-host" />
-        <div class="viewport-tip">左键旋转 · 滚轮缩放 · 右键/中键平移</div>
+        <div class="viewport-tip">{{ t('viewportTip') }}</div>
       </section>
 
       <aside class="panel panel-right">
-        <div class="panel-title">计算结果</div>
+        <div class="panel-title">{{ t('resultTitle') }}</div>
         <template v-if="result">
-          <div class="row"><span>UTC</span><b>{{ result.epoch }}</b></div>
-          <div class="row"><span>ET (s)</span><b>{{ result.et_seconds.toFixed(3) }}</b></div>
-          <div class="group">ECI 位置（km）</div>
+          <div class="row"><span>{{ t('utc') }}</span><b>{{ result.epoch }}</b></div>
+          <div class="row"><span>{{ t('etSeconds') }}</span><b>{{ result.et_seconds.toFixed(3) }}</b></div>
+          <div class="group">{{ t('eciPosition') }}</div>
           <div class="vec">{{ vec(result.eci.position_km) }}</div>
-          <div class="group">ECI 速度（km/s）</div>
+          <div class="group">{{ t('eciVelocity') }}</div>
           <div class="vec">{{ vec(result.eci.velocity_km_s) }}</div>
-          <div class="group">地固系位置（km）</div>
+          <div class="group">{{ t('ecefPosition') }}</div>
           <div class="vec">{{ vec(result.ecef.position_km) }}</div>
-          <div class="group">大地坐标</div>
-          <div class="row"><span>经度</span><b>{{ result.longitude_deg.toFixed(3) }}°</b></div>
-          <div class="row"><span>纬度</span><b>{{ result.latitude_deg.toFixed(3) }}°</b></div>
-          <div class="row"><span>高度</span><b>{{ result.altitude_km.toFixed(3) }} km</b></div>
+          <div class="group">{{ t('geodetic') }}</div>
+          <div class="row"><span>{{ t('longitude') }}</span><b>{{ result.longitude_deg.toFixed(3) }}°</b></div>
+          <div class="row"><span>{{ t('latitude') }}</span><b>{{ result.latitude_deg.toFixed(3) }}°</b></div>
+          <div class="row"><span>{{ t('altitude') }}</span><b>{{ result.altitude_km.toFixed(3) }} km</b></div>
         </template>
-        <el-empty v-else description="尚未计算" :image-size="72" />
+        <el-empty v-else :description="t('noResult')" :image-size="72" />
       </aside>
     </main>
   </div>
@@ -308,6 +211,10 @@ onBeforeUnmount(() => {
   font-size: 14px;
   font-weight: 600;
   letter-spacing: 0.04em;
+}
+
+.phase {
+  border-color: var(--kst-border);
 }
 
 .spacer {
@@ -379,7 +286,7 @@ onBeforeUnmount(() => {
   position: relative;
   flex: 1;
   min-width: 0;
-  background: #05080f;
+  background: #04060b;
 }
 
 .cesium-host {
@@ -394,7 +301,7 @@ onBeforeUnmount(() => {
   padding: 4px 8px;
   border: 1px solid var(--kst-border);
   border-radius: 4px;
-  background: rgba(9, 15, 26, 0.82);
+  background: rgba(9, 13, 18, 0.82);
   font-size: 11px;
   color: var(--kst-text-dim);
   pointer-events: none;
@@ -420,11 +327,11 @@ onBeforeUnmount(() => {
   margin-bottom: 4px;
   font-size: 11px;
   letter-spacing: 0.06em;
-  color: var(--kst-accent);
+  color: var(--kst-accent-strong);
 }
 
 .vec {
-  font-family: Consolas, 'Cascadia Mono', monospace;
+  font-family: 'JetBrains Mono', Consolas, 'Cascadia Mono', monospace;
   font-size: 12px;
   line-height: 1.6;
   color: var(--kst-text);

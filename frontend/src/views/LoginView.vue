@@ -1,22 +1,25 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance } from 'element-plus'
 
+import LangSwitch from '@/components/LangSwitch.vue'
 import { useAuthStore } from '@/stores/auth'
+import { useI18n } from '@/i18n'
 
 const router = useRouter()
 const route = useRoute()
 const auth = useAuthStore()
+const { t } = useI18n()
 
 const formRef = ref<FormInstance>()
 const loading = ref(false)
 const form = reactive({ username: '', password: '' })
 
-const rules = {
-  username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
-  password: [{ required: true, message: '请输入密码', trigger: 'blur' }]
-}
+const rules = computed(() => ({
+  username: [{ required: true, message: t('usernameRequired'), trigger: 'blur' }],
+  password: [{ required: true, message: t('passwordRequired'), trigger: 'blur' }]
+}))
 
 async function onSubmit() {
   if (!formRef.value) return
@@ -29,7 +32,7 @@ async function onSubmit() {
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/situation'
     await router.replace(redirect)
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '登录失败')
+    ElMessage.error(error instanceof Error ? error.message : t('loginFailed'))
   } finally {
     loading.value = false
   }
@@ -38,28 +41,42 @@ async function onSubmit() {
 
 <template>
   <div class="login-page">
+    <div class="topbar">
+      <LangSwitch />
+    </div>
+
     <div class="brand">
       <h1>KST</h1>
-      <p>Kaiyun Satellite Tool · 空间任务分析与仿真平台</p>
+      <p>{{ t('brandSubtitle') }}</p>
     </div>
     <el-card class="login-card" shadow="always">
-      <template #header>登录</template>
-      <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="onSubmit">
-        <el-form-item label="用户名" prop="username">
-          <el-input v-model="form.username" autocomplete="username" placeholder="请输入用户名" />
+      <template #header>{{ t('login') }}</template>
+      <el-form
+        ref="formRef"
+        :model="form"
+        :rules="rules"
+        label-position="top"
+        @submit.prevent="onSubmit"
+      >
+        <el-form-item :label="t('username')" prop="username">
+          <el-input
+            v-model="form.username"
+            autocomplete="username"
+            :placeholder="t('usernamePlaceholder')"
+          />
         </el-form-item>
-        <el-form-item label="密码" prop="password">
+        <el-form-item :label="t('password')" prop="password">
           <el-input
             v-model="form.password"
             type="password"
             show-password
             autocomplete="current-password"
-            placeholder="请输入密码"
+            :placeholder="t('passwordPlaceholder')"
             @keyup.enter="onSubmit"
           />
         </el-form-item>
         <el-button type="primary" class="submit" :loading="loading" @click="onSubmit">
-          登录
+          {{ t('login') }}
         </el-button>
       </el-form>
     </el-card>
@@ -68,14 +85,21 @@ async function onSubmit() {
 
 <style scoped lang="scss">
 .login-page {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 72px;
   height: 100%;
   background:
-    radial-gradient(circle at 20% 30%, rgba(47, 155, 255, 0.16), transparent 45%),
+    radial-gradient(circle at 20% 30%, rgba(91, 155, 184, 0.14), transparent 45%),
     var(--kst-bg);
+}
+
+.topbar {
+  position: absolute;
+  top: 16px;
+  right: 20px;
 }
 
 .brand {
