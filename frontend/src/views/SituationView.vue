@@ -1401,7 +1401,7 @@ function formatDuration(seconds: number) {
           </el-tab-pane>
 
           <el-tab-pane :label="t('tabAi')" name="ai">
-            <AiPanel />
+            <AiPanel :active="activeTab === 'ai'" />
           </el-tab-pane>
         </el-tabs>
       </aside>

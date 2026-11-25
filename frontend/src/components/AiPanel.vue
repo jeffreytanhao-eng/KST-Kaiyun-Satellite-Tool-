@@ -19,6 +19,8 @@ type Action = 'interpret' | 'recommend' | 'report'
 const store = useScenarioStore()
 const { t, locale } = useI18n()
 
+const props = defineProps<{ active?: boolean }>()
+
 const config = ref<AiConfig | null>(null)
 const configLoading = ref(false)
 const busy = ref<Action | null>(null)
@@ -68,6 +70,14 @@ watch(
 )
 
 onMounted(loadConfig)
+
+// 切换回 AI 页签时重新读取配置，避免后端更换模型/接入点后仍显示旧值。
+watch(
+  () => props.active,
+  (active) => {
+    if (active) void loadConfig()
+  }
+)
 
 async function loadConfig() {
   configLoading.value = true
