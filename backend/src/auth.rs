@@ -37,6 +37,7 @@ pub struct Claims {
 #[derive(Clone)]
 pub struct AuthUser {
     pub id: Uuid,
+    pub org_id: Option<Uuid>,
 }
 
 impl AuthService {
@@ -127,7 +128,10 @@ impl FromRequestParts<AppState> for AuthUser {
             .ok_or(AppError::Unauthorized("认证格式错误"))?;
 
         let claims = state.auth.verify(token)?;
-        Ok(AuthUser { id: claims.sub })
+        Ok(AuthUser {
+            id: claims.sub,
+            org_id: claims.org_id,
+        })
     }
 }
 

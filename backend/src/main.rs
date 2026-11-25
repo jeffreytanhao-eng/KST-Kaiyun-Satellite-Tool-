@@ -2,7 +2,9 @@ mod auth;
 mod config;
 mod db;
 mod error;
+mod orbit;
 mod routes;
+mod scenario;
 mod space;
 mod state;
 

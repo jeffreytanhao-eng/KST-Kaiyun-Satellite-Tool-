@@ -14,6 +14,7 @@ dotenvy = "0.15"
 hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sgp4 = "0.2"
 sha2 = "0.10"
 stkcraft-geocalc = "0.2.2"
 stkcraft-time = "0.2.1"
@@ -23,6 +24,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
     "uuid",
     "chrono",
+    "json",
     "migrate",
     "macros",
 ] }

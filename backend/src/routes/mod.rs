@@ -4,6 +4,8 @@ use serde::Serialize;
 use crate::{auth, state::AppState};
 
 mod compute;
+mod jobs;
+mod scenarios;
 
 /// 挂载在 /api/v1 下的全部路由。
 pub fn router() -> Router<AppState> {
@@ -11,6 +13,8 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(health))
         .nest("/auth", auth::router())
         .nest("/compute", compute::router())
+        .nest("/scenarios", scenarios::router())
+        .nest("/jobs", jobs::router())
 }
 
 #[derive(Serialize)]
