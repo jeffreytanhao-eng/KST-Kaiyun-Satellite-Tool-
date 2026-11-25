@@ -1,0 +1,26 @@
+:root {
+  color-scheme: dark;
+  --kst-bg: #070b14;
+  --kst-panel: #0f1726;
+  --kst-border: #1d2a3f;
+  --kst-text: #d7e2f0;
+  --kst-text-dim: #7f90a8;
+  --kst-accent: #2f9bff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--kst-bg);
+  color: var(--kst-text);
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}

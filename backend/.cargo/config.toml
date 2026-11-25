@@ -1,0 +1,16 @@
+# 国内网络环境下加速 crates.io 依赖下载（rsproxy 镜像）
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+
+# 本机没有 MSVC C++ 工具链，使用项目内置的 MinGW-w64 GCC（LLVM 版 dlltool + LLD）链接 Windows GNU 目标。
+# 工具链位于项目 .tools/winlibs，构建产物使用默认的 backend/target 目录（均为纯 ASCII 路径）。
+[target.x86_64-pc-windows-gnu]
+linker = "D:/project/KST/.tools/winlibs/mingw64/bin/x86_64-w64-mingw32-gcc.exe"
+ar = "ar"
+rustflags = ["-Clink-arg=-fuse-ld=lld"]
