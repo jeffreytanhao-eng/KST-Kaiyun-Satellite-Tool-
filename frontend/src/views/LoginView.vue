@@ -40,7 +40,7 @@ async function onSubmit() {
   <div class="login-page">
     <div class="brand">
       <h1>KST</h1>
-      <p>开云卫星工具 · 空间任务分析与仿真平台</p>
+      <p>Kaiyun Satellite Tool · 空间任务分析与仿真平台</p>
     </div>
     <el-card class="login-card" shadow="always">
       <template #header>登录</template>

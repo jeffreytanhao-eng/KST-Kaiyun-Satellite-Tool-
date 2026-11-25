@@ -1,4 +1,4 @@
-# KST · 开云卫星工具（Kaiyun Satellite Tool）
+# KST · Kaiyun Satellite Tool
 
 基于 Web 的服务器端空间任务分析与仿真平台，对标 STK 核心能力。用户无需安装客户端，所有轨道计算在服务器完成，浏览器负责交互与三维可视化。
 

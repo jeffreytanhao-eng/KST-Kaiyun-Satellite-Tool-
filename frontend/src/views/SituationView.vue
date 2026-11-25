@@ -11,7 +11,7 @@ import { useAuthStore } from '@/stores/auth'
 const router = useRouter()
 const auth = useAuthStore()
 
-const productName = 'KST · 开云卫星工具'
+const productName = 'KST · Kaiyun Satellite Tool'
 const phaseLabel = 'Phase 0 · 基础打通'
 
 const viewerHost = ref<HTMLDivElement | null>(null)
