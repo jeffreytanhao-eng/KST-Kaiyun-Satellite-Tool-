@@ -7,6 +7,7 @@ mod ai;
 mod compute;
 mod jobs;
 mod scenarios;
+mod spacetrack;
 
 /// 挂载在 /api/v1 下的全部路由。
 pub fn router() -> Router<AppState> {
@@ -17,6 +18,7 @@ pub fn router() -> Router<AppState> {
         .nest("/scenarios", scenarios::router())
         .nest("/jobs", jobs::router())
         .nest("/ai", ai::router())
+        .nest("/spacetrack", spacetrack::router())
 }
 
 #[derive(Serialize)]

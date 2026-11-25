@@ -14,7 +14,11 @@ use crate::{
     auth::AuthUser,
     environment::{self, EnvironmentOptions, EnvironmentReport},
     error::AppError,
-    orbit::{self, AccessOptions, AccessReport, CoverageRegion, CoverageReport},
+    link::{self, LinkBudgetReport, LinkOptions},
+    orbit::{
+        self, AccessOptions, AccessReport, CoverageRegion, CoverageReport,
+        PropagationCompareReport,
+    },
     scenario::ScenarioData,
     state::AppState,
 };
@@ -153,6 +157,27 @@ struct EnvironmentParams {
     options: EnvironmentOptions,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct CompareParams {
+    satellite_id: String,
+    start: String,
+    end: String,
+    #[serde(default = "default_step")]
+    step_seconds: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LinkParams {
+    satellite_id: String,
+    ground_station_id: String,
+    start: String,
+    end: String,
+    #[serde(default = "default_step")]
+    step_seconds: f64,
+    #[serde(default)]
+    options: LinkOptions,
+}
+
 fn default_step() -> f64 {
     30.0
 }
@@ -242,6 +267,26 @@ fn validate_params(kind: &str, params: &Value) -> Result<(), AppError> {
                 .map_err(|err| AppError::BadRequest(format!("环境参数无效：{err}")))?;
             if params.satellite_id.trim().is_empty() {
                 return Err(AppError::BadRequest("请选择卫星".into()));
+            }
+            let start = parse_time(&params.start, "start")?;
+            let end = parse_time(&params.end, "end")?;
+            validate_window(start, end, params.step_seconds)
+        }
+        "propagation_compare" => {
+            let params: CompareParams = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("对比参数无效：{err}")))?;
+            if params.satellite_id.trim().is_empty() {
+                return Err(AppError::BadRequest("请选择卫星".into()));
+            }
+            let start = parse_time(&params.start, "start")?;
+            let end = parse_time(&params.end, "end")?;
+            validate_window(start, end, params.step_seconds)
+        }
+        "link_budget" => {
+            let params: LinkParams = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("链路参数无效：{err}")))?;
+            if params.satellite_id.trim().is_empty() || params.ground_station_id.trim().is_empty() {
+                return Err(AppError::BadRequest("请选择卫星与地面站".into()));
             }
             let start = parse_time(&params.start, "start")?;
             let end = parse_time(&params.end, "end")?;
@@ -386,6 +431,19 @@ async fn job_csv(
                 .map_err(|err| AppError::Internal(format!("环境结果解析失败：{err}")))?;
             (environment_csv(&report), format!("environment-{id}.csv"))
         }
+        "propagation_compare" => {
+            let report: PropagationCompareReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("对比结果解析失败：{err}")))?;
+            (compare_csv(&report), format!("propagation-compare-{id}.csv"))
+        }
+        "link_budget" => {
+            let report: LinkBudgetReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("链路结果解析失败：{err}")))?;
+            (
+                format!("\u{feff}{}", link::link_csv(&report)),
+                format!("link-budget-{id}.csv"),
+            )
+        }
         _ => return Err(AppError::BadRequest("该任务类型不支持 CSV 导出".into())),
     };
 
@@ -459,6 +517,27 @@ fn environment_csv(report: &EnvironmentReport) -> String {
             sample.temperature_k,
             sample.drag_accel_m_s2,
             sample.cumulative_delta_v_m_s
+        ));
+    }
+    output
+}
+
+fn compare_csv(report: &PropagationCompareReport) -> String {
+    let mut output = String::from(
+        "\u{feff}t_seconds,sgp4_longitude_deg,sgp4_latitude_deg,sgp4_altitude_km,numerical_longitude_deg,numerical_latitude_deg,numerical_altitude_km,position_difference_km,velocity_difference_km_s\n",
+    );
+    for sample in &report.samples {
+        output.push_str(&format!(
+            "{:.1},{:.6},{:.6},{:.3},{:.6},{:.6},{:.3},{:.6},{:.9}\n",
+            sample.t_seconds,
+            sample.sgp4_longitude_deg,
+            sample.sgp4_latitude_deg,
+            sample.sgp4_altitude_km,
+            sample.numerical_longitude_deg,
+            sample.numerical_latitude_deg,
+            sample.numerical_altitude_km,
+            sample.position_difference_km,
+            sample.velocity_difference_km_s
         ));
     }
     output
@@ -593,6 +672,34 @@ fn compute_job_result(kind: &str, params: &Value, scenario: &ScenarioData) -> Re
             let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
             let report = environment::analyze_environment(
                 satellite,
+                start,
+                end,
+                params.step_seconds,
+                &params.options,
+            )?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "propagation_compare" => {
+            let params: CompareParams = serde_json::from_value(params.clone())
+                .map_err(|err| format!("对比参数无效：{err}"))?;
+            let satellite = scenario
+                .satellite(&params.satellite_id)
+                .ok_or_else(|| format!("场景中不存在卫星 {}", params.satellite_id))?;
+            let start = parse_time(&params.start, "start").map_err(|err| err.to_string())?;
+            let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
+            let report =
+                orbit::compare_propagation(satellite, start, end, params.step_seconds)?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "link_budget" => {
+            let params: LinkParams = serde_json::from_value(params.clone())
+                .map_err(|err| format!("链路参数无效：{err}"))?;
+            let start = parse_time(&params.start, "start").map_err(|err| err.to_string())?;
+            let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
+            let report = link::compute_link_budget(
+                scenario,
+                &params.satellite_id,
+                &params.ground_station_id,
                 start,
                 end,
                 params.step_seconds,

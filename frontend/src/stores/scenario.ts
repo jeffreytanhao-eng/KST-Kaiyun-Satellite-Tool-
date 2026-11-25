@@ -21,6 +21,9 @@ import {
   type CoverageReport,
   type EnvironmentReport,
   type Job,
+  type LinkBudgetReport,
+  type LinkOptions,
+  type PropagationCompareReport,
   type PropagationReport
 } from '@/api/jobs'
 
@@ -67,6 +70,14 @@ export const useScenarioStore = defineStore('scenario', () => {
   const environmentJob = ref<Job | null>(null)
   const environmentBusy = ref(false)
 
+  const compareReport = ref<PropagationCompareReport | null>(null)
+  const compareJob = ref<Job | null>(null)
+  const compareBusy = ref(false)
+
+  const linkReport = ref<LinkBudgetReport | null>(null)
+  const linkJob = ref<Job | null>(null)
+  const linkBusy = ref(false)
+
   const hasSatellites = computed(() => (current.value?.data.satellites.length ?? 0) > 0)
   const hasStations = computed(
     () => (current.value?.data.ground_stations.length ?? 0) > 0
@@ -81,6 +92,10 @@ export const useScenarioStore = defineStore('scenario', () => {
     coverageJob.value = null
     environmentReport.value = null
     environmentJob.value = null
+    compareReport.value = null
+    compareJob.value = null
+    linkReport.value = null
+    linkJob.value = null
   }
 
   async function loadList() {
@@ -434,6 +449,76 @@ export const useScenarioStore = defineStore('scenario', () => {
     }
   }
 
+  async function runComparison(params: {
+    satelliteId: string
+    start: Date
+    end: Date
+    stepSeconds?: number
+  }) {
+    if (!current.value || compareBusy.value) return null
+    compareBusy.value = true
+    compareReport.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'propagation_compare',
+        params: {
+          satellite_id: params.satelliteId,
+          start: params.start.toISOString(),
+          end: params.end.toISOString(),
+          step_seconds: params.stepSeconds ?? 30
+        }
+      })
+      compareJob.value = job
+      const done = await waitForJob(job.id)
+      compareJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '传播器对比失败')
+      }
+      compareReport.value = done.result as PropagationCompareReport
+      return compareReport.value
+    } finally {
+      compareBusy.value = false
+    }
+  }
+
+  async function runLink(params: {
+    satelliteId: string
+    stationId: string
+    start: Date
+    end: Date
+    stepSeconds?: number
+    options: LinkOptions
+  }) {
+    if (!current.value || linkBusy.value) return null
+    linkBusy.value = true
+    linkReport.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'link_budget',
+        params: {
+          satellite_id: params.satelliteId,
+          ground_station_id: params.stationId,
+          start: params.start.toISOString(),
+          end: params.end.toISOString(),
+          step_seconds: params.stepSeconds ?? 30,
+          options: params.options
+        }
+      })
+      linkJob.value = job
+      const done = await waitForJob(job.id)
+      linkJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '链路预算计算失败')
+      }
+      linkReport.value = done.result as LinkBudgetReport
+      return linkReport.value
+    } finally {
+      linkBusy.value = false
+    }
+  }
+
   return {
     scenarios,
     current,
@@ -451,6 +536,12 @@ export const useScenarioStore = defineStore('scenario', () => {
     environmentReport,
     environmentJob,
     environmentBusy,
+    compareReport,
+    compareJob,
+    compareBusy,
+    linkReport,
+    linkJob,
+    linkBusy,
     hasSatellites,
     hasStations,
     loadList,
@@ -466,6 +557,8 @@ export const useScenarioStore = defineStore('scenario', () => {
     runAccess,
     runCoverage,
     runEnvironment,
+    runComparison,
+    runLink,
     resetResults
   }
 })

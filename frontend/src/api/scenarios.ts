@@ -1,5 +1,8 @@
 import { request } from './http'
 
+export type PropagatorType = 'sgp4' | 'numerical'
+export type AttitudeMode = 'nadir' | 'sun' | 'fixed'
+
 export interface SatelliteObject {
   id: string
   name: string
@@ -8,6 +11,17 @@ export interface SatelliteObject {
   tle_line1: string
   tle_line2: string
   norad_id?: number | null
+  propagator_type?: PropagatorType
+  attitude_mode?: AttitudeMode
+  attitude_roll_deg?: number
+  attitude_pitch_deg?: number
+  attitude_yaw_deg?: number
+  mass_kg?: number
+  area_m2?: number
+  drag_coefficient?: number
+  integrator_tolerance?: number
+  enable_j2?: boolean
+  enable_drag?: boolean
 }
 
 export interface GroundStationObject {
@@ -22,7 +36,7 @@ export interface GroundStationObject {
 }
 
 export type SensorShape = 'conical' | 'rectangular'
-export type SensorPointingMode = 'nadir' | 'fixed' | 'target'
+export type SensorPointingMode = 'nadir' | 'fixed' | 'target' | 'body'
 
 export interface SensorObject {
   id: string
@@ -35,6 +49,7 @@ export interface SensorObject {
   horizontal_fov_deg: number
   vertical_fov_deg: number
   pointing_mode: SensorPointingMode
+  body_boresight?: [number, number, number]
   fixed_azimuth_deg: number
   fixed_off_nadir_deg: number
   target_station_id?: string | null
@@ -107,4 +122,25 @@ export function importScenario(payload: ScenarioPayload) {
 
 export function emptyScenarioData(): ScenarioData {
   return { satellites: [], ground_stations: [], sensors: [] }
+}
+
+export interface SpaceTrackTle {
+  norad_id: number
+  name: string
+  tle_line1: string
+  tle_line2: string
+  epoch: string | null
+}
+
+export interface SpaceTrackResponse {
+  count: number
+  items: SpaceTrackTle[]
+}
+
+/** 从 Space-Track 拉取最新 TLE（后端使用配置的账号登录）。 */
+export function fetchSpaceTrackTle(noradIds: number[]) {
+  return request<SpaceTrackResponse>('/spacetrack/tle', {
+    method: 'POST',
+    body: JSON.stringify({ norad_ids: noradIds })
+  })
 }

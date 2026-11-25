@@ -179,14 +179,36 @@ function formatDuration(seconds: number) {
         <b>{{ formatDuration(report.max_visible_seconds) }}</b>
       </div>
       <div class="stat">
-        <span>{{ t('coverageGridStep') }}</span>
-        <b>{{ report.grid_step_deg }}°</b>
+        <span>{{ t('coverageMultiCovered') }}</span>
+        <b>{{ report.multi_covered_points }}</b>
       </div>
       <div class="stat">
-        <span>{{ t('coverageMinElevation') }}</span>
-        <b>{{ report.min_elevation_deg }}°</b>
+        <span>{{ t('coverageUncovered') }}</span>
+        <b>{{ report.uncovered_points }}</b>
       </div>
     </div>
+
+    <div v-if="report.satellite_stats.length > 1" class="section-title">
+      {{ t('coveragePerSatellite') }}
+    </div>
+    <el-table
+      v-if="report.satellite_stats.length > 1"
+      :data="report.satellite_stats"
+      size="small"
+      height="150"
+      class="table"
+    >
+      <el-table-column prop="satellite_name" :label="t('coverageSatellite')" min-width="110" />
+      <el-table-column :label="t('coverageSatelliteCovered')" width="86">
+        <template #default="{ row }">{{ row.covered_points }}</template>
+      </el-table-column>
+      <el-table-column :label="t('coverageSatelliteRatio')" width="86">
+        <template #default="{ row }">{{ (row.coverage_ratio * 100).toFixed(1) }}%</template>
+      </el-table-column>
+      <el-table-column :label="t('coverageSatelliteVisible')" min-width="96">
+        <template #default="{ row }">{{ formatDuration(row.total_visible_seconds) }}</template>
+      </el-table-column>
+    </el-table>
 
     <el-table :data="topPoints" size="small" height="180" class="table">
       <el-table-column :label="t('latitude')" width="76">

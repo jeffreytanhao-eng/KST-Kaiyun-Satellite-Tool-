@@ -1,9 +1,12 @@
 mod ai;
+mod attitude;
 mod auth;
 mod config;
 mod db;
 mod environment;
 mod error;
+mod link;
+mod numerical;
 mod orbit;
 mod routes;
 mod scenario;
@@ -52,14 +55,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         space: std::sync::Arc::new(space),
         ai: std::sync::Arc::new(ai),
+        config: std::sync::Arc::new(config),
     };
+
+    let addr: SocketAddr = state.config.http_addr.parse()?;
 
     let app = Router::new()
         .nest("/api/v1", routes::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr: SocketAddr = config.http_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "KST backend listening");
     axum::serve(listener, app).await?;

@@ -167,7 +167,6 @@ function errorText(error: unknown) {
     <el-tag size="small" :type="enabled ? 'success' : 'info'" effect="plain">
       {{ enabled ? t('aiEnabled') : t('aiDisabled') }}
     </el-tag>
-    <span v-if="config?.model" class="model">{{ t('aiModel') }}: {{ config.model }}</span>
   </div>
   <div v-if="!enabled && !configLoading" class="hint">{{ t('aiDisabledHint') }}</div>
 
@@ -266,12 +265,6 @@ function errorText(error: unknown) {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-}
-
-.model {
-  font-size: 10.5px;
-  color: var(--kst-text-dim);
-  word-break: break-all;
 }
 
 .hint {

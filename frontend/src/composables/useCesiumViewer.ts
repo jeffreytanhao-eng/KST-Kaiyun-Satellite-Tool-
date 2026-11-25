@@ -5,7 +5,12 @@ import type { ScenarioData, SatelliteObject } from '@/api/scenarios'
 import type {
   AccessReport,
   AccessWindow,
+  AttitudeSample,
+  AttitudeTrack,
   CoverageReport,
+  LinkBudgetReport,
+  LinkWindow,
+  PropagationCompareReport,
   PropagationReport,
   SatelliteTrack,
   SensorSample,
@@ -53,6 +58,13 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
   let linkEntity: Cesium.Entity | null = null
   let coveragePrimitive: Cesium.Primitive | null = null
   let playhead = 0
+  let attitudeTracks = new Map<string, AttitudeTrack>()
+  const attitudeEntities = new Map<string, Cesium.Entity[]>()
+  let linkBudgetReport: LinkBudgetReport | null = null
+  let linkTimeOffset = 0
+  let linkBudgetEntities: Cesium.Entity[] = []
+  let linkBudgetLine: Cesium.Entity | null = null
+  let comparisonEntities: Cesium.Entity[] = []
   async function init() {
     if (!host.value) return
 
@@ -129,6 +141,12 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     accessEntities = []
     linkEntity = null
     playhead = 0
+    attitudeTracks = new Map()
+    attitudeEntities.clear()
+    linkBudgetReport = null
+    linkBudgetEntities = []
+    linkBudgetLine = null
+    comparisonEntities = []
   }
 
   function renderScenario(data: ScenarioData, report: PropagationReport | null) {
@@ -240,6 +258,34 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
       satellites.set(satellite.id, { data: satellite, track, entity })
     })
 
+    for (const track of report?.attitude_tracks ?? []) {
+      if (!satellites.has(track.satellite_id) || track.samples.length === 0) continue
+      attitudeTracks.set(track.satellite_id, track)
+      const axes: Array<{ suffix: string; color: Cesium.Color }> = [
+        { suffix: 'x', color: Cesium.Color.fromCssColorString('#ef5350') },
+        { suffix: 'y', color: Cesium.Color.fromCssColorString('#66bb6a') },
+        { suffix: 'z', color: Cesium.Color.fromCssColorString('#42a5f5') }
+      ]
+      attitudeEntities.set(
+        track.satellite_id,
+        axes.map((axis) =>
+          instance.entities.add({
+            id: `attitude-${track.satellite_id}-${axis.suffix}`,
+            show: false,
+            polyline: {
+              positions: [] as Cesium.Cartesian3[],
+              width: 3,
+              arcType: Cesium.ArcType.NONE,
+              material: new Cesium.PolylineGlowMaterialProperty({
+                glowPower: 0.25,
+                color: axis.color.withAlpha(0.95)
+              })
+            }
+          })
+        )
+      )
+    }
+
     const sensorMap = new Map(data.sensors.map((sensor) => [sensor.id, sensor]))
     for (const track of report?.sensor_tracks ?? []) {
       const sensor = sensorMap.get(track.sensor_id)
@@ -323,7 +369,47 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     }
 
     updateSensors(tSeconds)
+    updateAttitude(tSeconds)
     updateAccessLink()
+    updateLinkBudget()
+  }
+
+  /** 更新卫星本体坐标轴（长度约 120 km，按实时姿态方向）。 */
+  function updateAttitude(tSeconds: number) {
+    const axisLength = 120_000
+    for (const [satelliteId, track] of attitudeTracks) {
+      const entities = attitudeEntities.get(satelliteId)
+      const visual = satellites.get(satelliteId)
+      if (!entities || !visual?.track) continue
+      const satelliteSample = sampleAt(visual.track.samples, tSeconds)
+      const attitude = attitudeAt(track.samples, tSeconds)
+      if (!satelliteSample || !attitude || !visual.data.enabled) {
+        for (const entity of entities) entity.show = false
+        continue
+      }
+      const origin = Cesium.Cartesian3.fromDegrees(
+        satelliteSample.longitude_deg,
+        satelliteSample.latitude_deg,
+        satelliteSample.altitude_km * 1000
+      )
+      const axes = [attitude.x, attitude.y, attitude.z]
+      entities.forEach((entity, index) => {
+        const axis = axes[index]
+        const tip = Cesium.Cartesian3.add(
+          origin,
+          Cesium.Cartesian3.multiplyByScalar(
+            new Cesium.Cartesian3(axis[0], axis[1], axis[2]),
+            axisLength,
+            new Cesium.Cartesian3()
+          ),
+          new Cesium.Cartesian3()
+        )
+        if (entity.polyline) {
+          entity.polyline.positions = new Cesium.ConstantProperty([origin, tip])
+          entity.show = true
+        }
+      })
+    }
   }
 
   function updateSensors(tSeconds: number) {
@@ -581,6 +667,184 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     updateAccessLink()
   }
 
+  function marginColor(marginDb: number) {
+    if (marginDb >= 3) return Cesium.Color.fromCssColorString('#66bb6a')
+    if (marginDb >= 0) return Cesium.Color.fromCssColorString('#ffb74d')
+    return Cesium.Color.fromCssColorString('#ef5350')
+  }
+
+  /** 显示链路预算：按余量着色的过境弧段 + 实时链路连线。 */
+  function showLinkBudget(report: LinkBudgetReport | null, timeOffsetSeconds = 0) {
+    const instance = viewer.value
+    if (!instance) return
+    clearLinkBudget()
+    linkBudgetReport = report
+    linkTimeOffset = timeOffsetSeconds
+    if (!report) return
+
+    const visual = satellites.get(report.satellite_id)
+    if (!visual?.track) return
+    const station = stations.get(report.ground_station_id)
+
+    for (const window of report.windows) {
+      const start = window.start_seconds + timeOffsetSeconds
+      const end = window.end_seconds + timeOffsetSeconds
+      const points = visual.track.samples.filter(
+        (sample) => sample.t_seconds >= start && sample.t_seconds <= end
+      )
+      if (points.length < 2) continue
+      const color = marginColor(window.min_margin_db)
+      const width = window.min_margin_db >= 3 ? 3 : window.min_margin_db >= 0 ? 4.5 : 6
+      linkBudgetEntities.push(
+        instance.entities.add({
+          id: `link-window-${window.index}`,
+          polyline: {
+            positions: Cesium.Cartesian3.fromDegreesArrayHeights(
+              points.flatMap((sample) => [
+                sample.longitude_deg,
+                sample.latitude_deg,
+                sample.altitude_km * 1000
+              ])
+            ),
+            width,
+            arcType: Cesium.ArcType.NONE,
+            material: new Cesium.PolylineGlowMaterialProperty({
+              glowPower: 0.28,
+              color: color.withAlpha(0.9)
+            })
+          }
+        })
+      )
+    }
+
+    if (station) {
+      linkBudgetLine = instance.entities.add({
+        id: 'link-budget-live',
+        show: false,
+        polyline: {
+          positions: [] as Cesium.Cartesian3[],
+          width: 3,
+          arcType: Cesium.ArcType.NONE,
+          material: new Cesium.PolylineDashMaterialProperty({
+            color: Cesium.Color.fromCssColorString('#66bb6a').withAlpha(0.95),
+            dashLength: 10
+          })
+        }
+      })
+      updateLinkBudget()
+    }
+  }
+
+  function updateLinkBudget() {
+    if (!linkBudgetLine || !linkBudgetReport) return
+    const visual = satellites.get(linkBudgetReport.satellite_id)
+    const station = stations.get(linkBudgetReport.ground_station_id)
+    if (!visual?.track || !station) {
+      linkBudgetLine.show = false
+      return
+    }
+    const shifted = linkBudgetReport.windows
+      .map((window) => ({
+        window,
+        start: window.start_seconds + linkTimeOffset,
+        end: window.end_seconds + linkTimeOffset
+      }))
+      .find((entry) => playhead >= entry.start && playhead <= entry.end)
+    const satelliteSample = sampleAt(visual.track.samples, playhead)
+    if (!shifted || !satelliteSample) {
+      linkBudgetLine.show = false
+      return
+    }
+
+    const localTime = playhead - linkTimeOffset
+    const sample = linkSampleAt(shifted.window, localTime)
+    const color = marginColor(sample?.margin_db ?? -99)
+    const positions = [
+      Cesium.Cartesian3.fromDegrees(
+        station.longitude,
+        station.latitude,
+        station.altitudeKm * 1000
+      ),
+      Cesium.Cartesian3.fromDegrees(
+        satelliteSample.longitude_deg,
+        satelliteSample.latitude_deg,
+        satelliteSample.altitude_km * 1000
+      )
+    ]
+    if (linkBudgetLine.polyline) {
+      linkBudgetLine.polyline.positions = new Cesium.ConstantProperty(positions)
+      linkBudgetLine.polyline.material = new Cesium.PolylineDashMaterialProperty({
+        color: color.withAlpha(0.95),
+        dashLength: 10
+      })
+      linkBudgetLine.show = true
+    }
+  }
+
+  function clearLinkBudget() {
+    const instance = viewer.value
+    if (!instance) return
+    for (const entity of linkBudgetEntities) instance.entities.remove(entity)
+    linkBudgetEntities = []
+    if (linkBudgetLine) {
+      instance.entities.remove(linkBudgetLine)
+      linkBudgetLine = null
+    }
+    linkBudgetReport = null
+  }
+
+  /** 显示 SGP4 与数值积分对比轨迹（实线 vs 虚线），并隐藏原始轨道线避免重叠。 */
+  function showComparison(report: PropagationCompareReport | null) {
+    const instance = viewer.value
+    if (!instance) return
+    clearComparison()
+    if (!report) return
+
+    const existing = instance.entities.getById(`orbit-${report.satellite_id}`)
+    if (existing) existing.show = false
+
+    const tracks: Array<{ track: SatelliteTrack; dashed: boolean }> = [
+      { track: report.sgp4_track, dashed: false },
+      { track: report.numerical_track, dashed: true }
+    ]
+    for (const { track, dashed } of tracks) {
+      if (track.samples.length < 2) continue
+      const color = Cesium.Color.fromCssColorString(track.color)
+      comparisonEntities.push(
+        instance.entities.add({
+          id: `compare-${track.satellite_id}`,
+          polyline: {
+            positions: Cesium.Cartesian3.fromDegreesArrayHeights(
+              track.samples.flatMap((sample) => [
+                sample.longitude_deg,
+                sample.latitude_deg,
+                sample.altitude_km * 1000
+              ])
+            ),
+            width: 3,
+            arcType: Cesium.ArcType.NONE,
+            material: dashed
+              ? new Cesium.PolylineDashMaterialProperty({
+                  color: color.withAlpha(0.95),
+                  dashLength: 14
+                })
+              : new Cesium.PolylineGlowMaterialProperty({
+                  glowPower: 0.2,
+                  color: color.withAlpha(0.9)
+                })
+          }
+        })
+      )
+    }
+  }
+
+  function clearComparison() {
+    const instance = viewer.value
+    if (!instance) return
+    for (const entity of comparisonEntities) instance.entities.remove(entity)
+    comparisonEntities = []
+  }
+
   function flyToScenario() {
     const instance = viewer.value
     if (!instance) return
@@ -649,6 +913,10 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     highlightAccess,
     showCoverage,
     clearCoverage,
+    showLinkBudget,
+    clearLinkBudget,
+    showComparison,
+    clearComparison,
     flyToScenario,
     flyToLocation,
     destroy
@@ -719,6 +987,65 @@ function sensorSampleAt(
     boresight: lerp(a.boresight, b.boresight),
     right: lerp(a.right, b.right),
     up: lerp(a.up, b.up)
+  }
+}
+
+/** 插值卫星姿态采样，并重新归一化三轴。 */
+function attitudeAt(samples: AttitudeSample[], tSeconds: number): AttitudeSample | null {
+  if (samples.length === 0) return null
+  const first = samples[0]
+  const last = samples[samples.length - 1]
+  if (tSeconds <= first.t_seconds) return first
+  if (tSeconds >= last.t_seconds) return last
+
+  const step = samples.length > 1 ? samples[1].t_seconds - first.t_seconds : 1
+  const index = Math.min(
+    Math.max(Math.floor((tSeconds - first.t_seconds) / (step || 1)), 0),
+    samples.length - 2
+  )
+  const a = samples[index]
+  const b = samples[index + 1]
+  const span = b.t_seconds - a.t_seconds || 1
+  const fraction = (tSeconds - a.t_seconds) / span
+  const lerp = (from: [number, number, number], to: [number, number, number]) =>
+    normalizeVector([
+      from[0] + (to[0] - from[0]) * fraction,
+      from[1] + (to[1] - from[1]) * fraction,
+      from[2] + (to[2] - from[2]) * fraction
+    ])
+
+  return {
+    t_seconds: tSeconds,
+    x: lerp(a.x, b.x),
+    y: lerp(a.y, b.y),
+    z: lerp(a.z, b.z),
+    quaternion: a.quaternion
+  }
+}
+
+/** 在 Access 窗口内按时间线性插值链路余量。 */
+function linkSampleAt(window: LinkWindow, tSeconds: number) {
+  if (window.samples.length === 0) return null
+  const first = window.samples[0]
+  const last = window.samples[window.samples.length - 1]
+  if (tSeconds <= first.t_seconds) return first
+  if (tSeconds >= last.t_seconds) return last
+  const index = window.samples.findIndex(
+    (sample, position) =>
+      position < window.samples.length - 1 &&
+      tSeconds >= sample.t_seconds &&
+      tSeconds <= window.samples[position + 1].t_seconds
+  )
+  if (index < 0) return last
+  const a = window.samples[index]
+  const b = window.samples[index + 1]
+  const span = b.t_seconds - a.t_seconds || 1
+  const fraction = (tSeconds - a.t_seconds) / span
+  return {
+    ...a,
+    t_seconds: tSeconds,
+    margin_db: a.margin_db + (b.margin_db - a.margin_db) * fraction,
+    elevation_deg: a.elevation_deg + (b.elevation_deg - a.elevation_deg) * fraction
   }
 }
 

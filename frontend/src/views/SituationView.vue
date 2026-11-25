@@ -18,20 +18,26 @@ import AiPanel from '@/components/AiPanel.vue'
 import CoveragePanel from '@/components/CoveragePanel.vue'
 import EnvironmentPanel from '@/components/EnvironmentPanel.vue'
 import LangSwitch from '@/components/LangSwitch.vue'
+import LinkPanel from '@/components/LinkPanel.vue'
 import ObjectTree from '@/components/ObjectTree.vue'
+import PropagationPanel from '@/components/PropagationPanel.vue'
 import { useCesiumViewer } from '@/composables/useCesiumViewer'
 import { useAuthStore } from '@/stores/auth'
 import { useScenarioStore } from '@/stores/scenario'
 import { useI18n } from '@/i18n'
-import type {
-  GroundStationObject,
-  SatelliteObject,
-  ScenarioData,
-  SensorObject,
-  SensorPointingMode,
-  SensorShape
+import {
+  fetchSpaceTrackTle,
+  type AttitudeMode,
+  type GroundStationObject,
+  type PropagatorType,
+  type SatelliteObject,
+  type ScenarioData,
+  type SensorObject,
+  type SensorPointingMode,
+  type SensorShape,
+  type SpaceTrackTle
 } from '@/api/scenarios'
-import { downloadJobCsv, type CoverageReport } from '@/api/jobs'
+import { downloadJobCsv, type CoverageReport, type LinkBudgetReport } from '@/api/jobs'
 
 type ObjectType = 'satellite' | 'station' | 'sensor'
 interface Selection {
@@ -53,7 +59,9 @@ const accessReport = computed(() => store.accessReport)
 const accessJob = computed(() => store.accessJob)
 
 const selection = ref<Selection | null>(null)
-const activeTab = ref<'props' | 'access' | 'coverage' | 'environment' | 'ai'>('props')
+const activeTab = ref<
+  'props' | 'access' | 'coverage' | 'propagation' | 'link' | 'environment' | 'ai'
+>('props')
 const importInput = ref<HTMLInputElement | null>(null)
 
 const scenarioId = computed({
@@ -222,6 +230,17 @@ const objectForm = reactive({
   enabled: true,
   line1: '',
   line2: '',
+  propagatorType: 'sgp4' as PropagatorType,
+  attitudeMode: 'nadir' as AttitudeMode,
+  attitudeRoll: 0,
+  attitudePitch: 0,
+  attitudeYaw: 0,
+  massKg: 500,
+  areaM2: 2,
+  dragCoefficient: 2.2,
+  integratorTolerance: 1e-9,
+  enableJ2: true,
+  enableDrag: true,
   latitude: 0,
   longitude: 0,
   altitude: 0,
@@ -232,6 +251,9 @@ const objectForm = reactive({
   hfov: 20,
   vfov: 20,
   pointingMode: 'nadir' as SensorPointingMode,
+  bodyBoresightX: 0,
+  bodyBoresightY: 0,
+  bodyBoresightZ: 1,
   fixedAzimuth: 0,
   offNadir: 0,
   targetStationId: '',
@@ -246,6 +268,17 @@ function syncObjectForm() {
     objectForm.enabled = satellite.enabled
     objectForm.line1 = satellite.tle_line1
     objectForm.line2 = satellite.tle_line2
+    objectForm.propagatorType = satellite.propagator_type ?? 'sgp4'
+    objectForm.attitudeMode = satellite.attitude_mode ?? 'nadir'
+    objectForm.attitudeRoll = satellite.attitude_roll_deg ?? 0
+    objectForm.attitudePitch = satellite.attitude_pitch_deg ?? 0
+    objectForm.attitudeYaw = satellite.attitude_yaw_deg ?? 0
+    objectForm.massKg = satellite.mass_kg ?? 500
+    objectForm.areaM2 = satellite.area_m2 ?? 2
+    objectForm.dragCoefficient = satellite.drag_coefficient ?? 2.2
+    objectForm.integratorTolerance = satellite.integrator_tolerance ?? 1e-9
+    objectForm.enableJ2 = satellite.enable_j2 ?? true
+    objectForm.enableDrag = satellite.enable_drag ?? true
     return
   }
   const station = selectedStation.value
@@ -270,6 +303,10 @@ function syncObjectForm() {
     objectForm.hfov = sensor.horizontal_fov_deg
     objectForm.vfov = sensor.vertical_fov_deg
     objectForm.pointingMode = sensor.pointing_mode
+    const boresight = sensor.body_boresight ?? [0, 0, 1]
+    objectForm.bodyBoresightX = boresight[0]
+    objectForm.bodyBoresightY = boresight[1]
+    objectForm.bodyBoresightZ = boresight[2]
     objectForm.fixedAzimuth = sensor.fixed_azimuth_deg
     objectForm.offNadir = sensor.fixed_off_nadir_deg
     objectForm.targetStationId = sensor.target_station_id ?? ''
@@ -305,6 +342,17 @@ async function onSaveObject() {
     satellite.enabled = objectForm.enabled
     satellite.tle_line1 = objectForm.line1.trim()
     satellite.tle_line2 = objectForm.line2.trim()
+    satellite.propagator_type = objectForm.propagatorType
+    satellite.attitude_mode = objectForm.attitudeMode
+    satellite.attitude_roll_deg = objectForm.attitudeRoll
+    satellite.attitude_pitch_deg = objectForm.attitudePitch
+    satellite.attitude_yaw_deg = objectForm.attitudeYaw
+    satellite.mass_kg = objectForm.massKg
+    satellite.area_m2 = objectForm.areaM2
+    satellite.drag_coefficient = objectForm.dragCoefficient
+    satellite.integrator_tolerance = objectForm.integratorTolerance
+    satellite.enable_j2 = objectForm.enableJ2
+    satellite.enable_drag = objectForm.enableDrag
   } else if (selection.value.type === 'station') {
     const station = data.ground_stations.find((item) => item.id === selection.value?.id)
     if (!station) return
@@ -335,6 +383,11 @@ async function onSaveObject() {
     sensor.horizontal_fov_deg = objectForm.hfov
     sensor.vertical_fov_deg = objectForm.vfov
     sensor.pointing_mode = objectForm.pointingMode
+    sensor.body_boresight = [
+      objectForm.bodyBoresightX,
+      objectForm.bodyBoresightY,
+      objectForm.bodyBoresightZ
+    ]
     sensor.fixed_azimuth_deg = objectForm.fixedAzimuth
     sensor.fixed_off_nadir_deg = objectForm.offNadir
     sensor.target_station_id =
@@ -422,6 +475,9 @@ const objectDialog = reactive({
   hfov: 20,
   vfov: 20,
   pointingMode: 'nadir' as SensorPointingMode,
+  bodyBoresightX: 0,
+  bodyBoresightY: 0,
+  bodyBoresightZ: 1,
   fixedAzimuth: 0,
   offNadir: 0,
   targetStationId: '',
@@ -455,6 +511,9 @@ function openAddObject(type: ObjectType) {
   objectDialog.hfov = 20
   objectDialog.vfov = 20
   objectDialog.pointingMode = 'nadir'
+  objectDialog.bodyBoresightX = 0
+  objectDialog.bodyBoresightY = 0
+  objectDialog.bodyBoresightZ = 1
   objectDialog.fixedAzimuth = 0
   objectDialog.offNadir = 0
   objectDialog.targetStationId = ''
@@ -515,6 +574,11 @@ async function submitAddObject() {
       horizontal_fov_deg: objectDialog.hfov,
       vertical_fov_deg: objectDialog.vfov,
       pointing_mode: objectDialog.pointingMode,
+      body_boresight: [
+        objectDialog.bodyBoresightX,
+        objectDialog.bodyBoresightY,
+        objectDialog.bodyBoresightZ
+      ],
       fixed_azimuth_deg: objectDialog.fixedAzimuth,
       fixed_off_nadir_deg: objectDialog.offNadir,
       target_station_id:
@@ -530,6 +594,93 @@ async function submitAddObject() {
   } catch (error) {
     ElMessage.error(errorText(error))
   }
+}
+
+/* ------------------------------ Space-Track 导入 ------------------------------ */
+
+const spaceTrackDialog = reactive({
+  visible: false,
+  noradInput: '',
+  loading: false,
+  items: [] as SpaceTrackTle[],
+  selected: [] as number[]
+})
+
+function openSpaceTrackDialog() {
+  spaceTrackDialog.noradInput = ''
+  spaceTrackDialog.items = []
+  spaceTrackDialog.selected = []
+  spaceTrackDialog.visible = true
+}
+
+async function fetchSpaceTrack() {
+  const ids = Array.from(
+    new Set(
+      spaceTrackDialog.noradInput
+        .split(/[\s,，;；]+/)
+        .map((item) => Number(item.trim()))
+        .filter((item) => Number.isInteger(item) && item > 0)
+    )
+  ).slice(0, 50)
+  if (ids.length === 0) {
+    ElMessage.warning(t('spaceTrackNoradHint'))
+    return
+  }
+  spaceTrackDialog.loading = true
+  try {
+    const response = await fetchSpaceTrackTle(ids)
+    spaceTrackDialog.items = response.items
+    spaceTrackDialog.selected = response.items.map((item) => item.norad_id)
+    if (response.items.length === 0) {
+      ElMessage.info(t('spaceTrackNoResult'))
+    }
+  } catch (error) {
+    ElMessage.error(`${t('spaceTrackFailed')}: ${errorText(error)}`)
+  } finally {
+    spaceTrackDialog.loading = false
+  }
+}
+
+async function importSpaceTrackItems() {
+  const data = cloneData()
+  if (!data) return
+  const chosen = spaceTrackDialog.items.filter((item) =>
+    spaceTrackDialog.selected.includes(item.norad_id)
+  )
+  if (chosen.length === 0) {
+    ElMessage.warning(t('spaceTrackSelectHint'))
+    return
+  }
+  let added = 0
+  for (const item of chosen) {
+    if (data.satellites.some((satellite) => satellite.norad_id === item.norad_id)) continue
+    data.satellites.push({
+      id: crypto.randomUUID(),
+      name: item.name || `NORAD ${item.norad_id}`,
+      enabled: true,
+      color: paletteColor(data.satellites.length),
+      tle_line1: item.tle_line1,
+      tle_line2: item.tle_line2,
+      norad_id: item.norad_id
+    })
+    added += 1
+  }
+  if (added === 0) {
+    ElMessage.info(t('spaceTrackNoResult'))
+    return
+  }
+  try {
+    await store.saveData(data)
+    spaceTrackDialog.visible = false
+    ElMessage.success(t('spaceTrackAdded').replace('{count}', String(added)))
+  } catch (error) {
+    ElMessage.error(errorText(error))
+  }
+}
+
+function paletteColor(index: number) {
+  const palette = ['#4fc3f7', '#ffb74d', '#81c784', '#e57373', '#ba68c8', '#4db6ac']
+  return palette[index % palette.length]
 }
 
 function onLocateObject() {
@@ -602,6 +753,24 @@ watch(
   () => store.accessReport,
   (report) => cesium.highlightAccess(report, accessTimeOffset(report))
 )
+
+watch(
+  () => store.compareReport,
+  (report) => cesium.showComparison(report)
+)
+
+watch(
+  () => store.linkReport,
+  (report) => cesium.showLinkBudget(report, linkTimeOffset(report))
+)
+
+/** 链路结果与传播结果的起始时刻之差（秒）。 */
+function linkTimeOffset(report: LinkBudgetReport | null) {
+  if (!report || !playback.value) return 0
+  return (
+    (new Date(report.start).getTime() - new Date(playback.value.start).getTime()) / 1000
+  )
+}
 
 /** Access 结果与传播结果的起始时刻之差（秒）。 */
 function accessTimeOffset(report: typeof accessReport.value) {
@@ -924,6 +1093,15 @@ function formatDuration(seconds: number) {
             {{ t('deleteScenario') }}
           </el-button>
         </div>
+        <el-button
+          size="small"
+          class="full"
+          :icon="Upload"
+          :disabled="!scenario"
+          @click="openSpaceTrackDialog"
+        >
+          {{ t('spaceTrackImport') }}
+        </el-button>
         <input
           ref="importInput"
           type="file"
@@ -1027,6 +1205,111 @@ function formatDuration(seconds: number) {
                   <div class="row">
                     <span>{{ t('noradId') }}</span>
                     <b>{{ selectedNorad }}</b>
+                  </div>
+
+                  <div class="section-title">{{ t('propagatorType') }}</div>
+                  <el-form-item :label="t('propagatorType')">
+                    <el-select v-model="objectForm.propagatorType" style="width: 100%">
+                      <el-option :label="t('propagatorSgp4')" value="sgp4" />
+                      <el-option :label="t('propagatorNumerical')" value="numerical" />
+                    </el-select>
+                  </el-form-item>
+                  <div class="hint-line">{{ t('propagatorHint') }}</div>
+                  <div class="grid2">
+                    <el-form-item :label="t('massKg')">
+                      <el-input-number
+                        v-model="objectForm.massKg"
+                        :min="0.01"
+                        :max="100000"
+                        :step="10"
+                        controls-position="right"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item :label="t('areaM2')">
+                      <el-input-number
+                        v-model="objectForm.areaM2"
+                        :min="0.001"
+                        :max="1000"
+                        :step="0.5"
+                        controls-position="right"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item :label="t('dragCoefficient')">
+                      <el-input-number
+                        v-model="objectForm.dragCoefficient"
+                        :min="0.5"
+                        :max="10"
+                        :step="0.1"
+                        :precision="2"
+                        controls-position="right"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item :label="t('integratorTolerance')">
+                      <el-input-number
+                        v-model="objectForm.integratorTolerance"
+                        :min="1e-12"
+                        :max="1e-3"
+                        :step="1e-9"
+                        :precision="12"
+                        controls-position="right"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                  </div>
+                  <div class="switch-row">
+                    <span>{{ t('enableJ2') }}</span>
+                    <el-switch v-model="objectForm.enableJ2" />
+                  </div>
+                  <div class="switch-row">
+                    <span>{{ t('enableDrag') }}</span>
+                    <el-switch v-model="objectForm.enableDrag" />
+                  </div>
+
+                  <div class="section-title">{{ t('attitudeMode') }}</div>
+                  <el-form-item :label="t('attitudeMode')">
+                    <el-select v-model="objectForm.attitudeMode" style="width: 100%">
+                      <el-option :label="t('attitudeNadir')" value="nadir" />
+                      <el-option :label="t('attitudeSun')" value="sun" />
+                      <el-option :label="t('attitudeFixed')" value="fixed" />
+                    </el-select>
+                  </el-form-item>
+                  <div v-if="objectForm.attitudeMode === 'fixed'" class="grid3">
+                    <el-form-item :label="t('attitudeRoll')">
+                      <el-input-number
+                        v-model="objectForm.attitudeRoll"
+                        :min="-180"
+                        :max="180"
+                        :step="1"
+                        :precision="2"
+                        controls-position="right"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item :label="t('attitudePitch')">
+                      <el-input-number
+                        v-model="objectForm.attitudePitch"
+                        :min="-180"
+                        :max="180"
+                        :step="1"
+                        :precision="2"
+                        controls-position="right"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
+                    <el-form-item :label="t('attitudeYaw')">
+                      <el-input-number
+                        v-model="objectForm.attitudeYaw"
+                        :min="-180"
+                        :max="180"
+                        :step="1"
+                        :precision="2"
+                        controls-position="right"
+                        style="width: 100%"
+                      />
+                    </el-form-item>
                   </div>
                 </template>
 
@@ -1137,6 +1420,7 @@ function formatDuration(seconds: number) {
                       <el-option :label="t('sensorNadir')" value="nadir" />
                       <el-option :label="t('sensorFixed')" value="fixed" />
                       <el-option :label="t('sensorTarget')" value="target" />
+                      <el-option :label="t('sensorBody')" value="body" />
                     </el-select>
                   </el-form-item>
                   <template v-if="objectForm.pointingMode === 'fixed'">
@@ -1176,6 +1460,34 @@ function formatDuration(seconds: number) {
                       />
                     </el-select>
                   </el-form-item>
+                  <template v-if="objectForm.pointingMode === 'body'">
+                    <el-form-item :label="t('sensorBodyBoresight')">
+                      <div class="grid3">
+                        <el-input-number
+                          v-model="objectForm.bodyBoresightX"
+                          :step="0.1"
+                          :precision="3"
+                          controls-position="right"
+                          style="width: 100%"
+                        />
+                        <el-input-number
+                          v-model="objectForm.bodyBoresightY"
+                          :step="0.1"
+                          :precision="3"
+                          controls-position="right"
+                          style="width: 100%"
+                        />
+                        <el-input-number
+                          v-model="objectForm.bodyBoresightZ"
+                          :step="0.1"
+                          :precision="3"
+                          controls-position="right"
+                          style="width: 100%"
+                        />
+                      </div>
+                    </el-form-item>
+                    <div class="hint-line">{{ t('sensorBodyHint') }}</div>
+                  </template>
                   <el-form-item :label="t('sensorMaxRange')">
                     <el-input-number
                       v-model="objectForm.maxRange"
@@ -1396,6 +1708,14 @@ function formatDuration(seconds: number) {
             <CoveragePanel @show-coverage="onShowCoverage" />
           </el-tab-pane>
 
+          <el-tab-pane :label="t('tabPropagation')" name="propagation">
+            <PropagationPanel />
+          </el-tab-pane>
+
+          <el-tab-pane :label="t('tabLink')" name="link">
+            <LinkPanel />
+          </el-tab-pane>
+
           <el-tab-pane :label="t('tabEnvironment')" name="environment">
             <EnvironmentPanel />
           </el-tab-pane>
@@ -1552,6 +1872,7 @@ function formatDuration(seconds: number) {
               <el-option :label="t('sensorNadir')" value="nadir" />
               <el-option :label="t('sensorFixed')" value="fixed" />
               <el-option :label="t('sensorTarget')" value="target" />
+              <el-option :label="t('sensorBody')" value="body" />
             </el-select>
           </el-form-item>
           <template v-if="objectDialog.pointingMode === 'fixed'">
@@ -1591,6 +1912,34 @@ function formatDuration(seconds: number) {
               />
             </el-select>
           </el-form-item>
+          <template v-if="objectDialog.pointingMode === 'body'">
+            <el-form-item :label="t('sensorBodyBoresight')">
+              <div class="grid3">
+                <el-input-number
+                  v-model="objectDialog.bodyBoresightX"
+                  :step="0.1"
+                  :precision="3"
+                  controls-position="right"
+                  style="width: 100%"
+                />
+                <el-input-number
+                  v-model="objectDialog.bodyBoresightY"
+                  :step="0.1"
+                  :precision="3"
+                  controls-position="right"
+                  style="width: 100%"
+                />
+                <el-input-number
+                  v-model="objectDialog.bodyBoresightZ"
+                  :step="0.1"
+                  :precision="3"
+                  controls-position="right"
+                  style="width: 100%"
+                />
+              </div>
+            </el-form-item>
+            <div class="hint-line">{{ t('sensorBodyHint') }}</div>
+          </template>
           <el-form-item :label="t('sensorMaxRange')">
             <el-input-number
               v-model="objectDialog.maxRange"
@@ -1614,6 +1963,72 @@ function formatDuration(seconds: number) {
           @click="submitAddObject"
         >
           {{ t('save') }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="spaceTrackDialog.visible"
+      :title="t('spaceTrackTitle')"
+      width="620px"
+    >
+      <el-form label-position="top" size="small" class="form">
+        <el-form-item :label="t('noradId')">
+          <el-input
+            v-model="spaceTrackDialog.noradInput"
+            :placeholder="t('spaceTrackNoradHint')"
+          />
+        </el-form-item>
+        <div class="hint-line">{{ t('spaceTrackNoradHint') }}</div>
+      </el-form>
+      <el-button
+        size="small"
+        type="primary"
+        :loading="spaceTrackDialog.loading"
+        @click="fetchSpaceTrack"
+      >
+        {{ t('spaceTrackFetch') }}
+      </el-button>
+
+      <el-table
+        v-if="spaceTrackDialog.items.length > 0"
+        :data="spaceTrackDialog.items"
+        size="small"
+        height="260"
+        class="table space-track-table"
+      >
+        <el-table-column width="48">
+          <template #default="{ row }">
+            <el-checkbox v-model="spaceTrackDialog.selected" :value="row.norad_id" />
+          </template>
+        </el-table-column>
+        <el-table-column prop="norad_id" :label="t('noradId')" width="92" />
+        <el-table-column
+          prop="name"
+          :label="t('name')"
+          min-width="160"
+          show-overflow-tooltip
+        />
+        <el-table-column :label="t('spaceTrackEpoch')" min-width="150">
+          <template #default="{ row }">
+            {{ row.epoch ? formatUtcString(row.epoch) : '—' }}
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-empty v-else :description="t('spaceTrackNoResult')" :image-size="48" />
+
+      <template #footer>
+        <el-button size="small" @click="spaceTrackDialog.visible = false">
+          {{ t('cancel') }}
+        </el-button>
+        <el-button
+          size="small"
+          type="primary"
+          :loading="store.saving"
+          :disabled="spaceTrackDialog.selected.length === 0"
+          @click="importSpaceTrackItems"
+        >
+          {{ t('spaceTrackImportSelected') }}
         </el-button>
       </template>
     </el-dialog>
@@ -1828,6 +2243,26 @@ function formatDuration(seconds: number) {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 0 8px;
+}
+
+.grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0 6px;
+  width: 100%;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 8px;
+  font-size: 12px;
+  color: var(--kst-text-dim);
+}
+
+.space-track-table {
+  margin-top: 10px;
 }
 
 .hint-line {

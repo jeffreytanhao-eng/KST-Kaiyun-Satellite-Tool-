@@ -17,6 +17,9 @@ pub struct Config {
     pub ai_api_key: String,
     pub ai_model: String,
     pub ai_timeout_seconds: u64,
+    /// Space-Track 账号（用于导入/更新 TLE；留空则视为未配置）。
+    pub space_track_username: String,
+    pub space_track_password: String,
 }
 
 impl Config {
@@ -57,6 +60,8 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(60),
+            space_track_username: env::var("KST_SPACETRACK_USERNAME").unwrap_or_default(),
+            space_track_password: env::var("KST_SPACETRACK_PASSWORD").unwrap_or_default(),
         })
     }
 }

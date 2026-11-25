@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::attitude::AttitudeFrame;
 use crate::scenario::SensorObject;
 
 /// 传感器在本体坐标系中的指向基（均为地固系单位向量）。
@@ -48,49 +49,93 @@ fn local_axes(latitude_deg: f64, longitude_deg: f64) -> ([f64; 3], [f64; 3]) {
 
 /// 计算传感器指向基。
 /// - `satellite_ecef`：卫星地固系位置（km）；
-/// - `target_ecef`：`target` 指向模式下的目标地面站位置（km）。
+/// - `target_ecef`：`target` 指向模式下的目标地面站位置（km）；
+/// - `attitude`：卫星真实姿态（若提供，则 `nadir`/`fixed`/`body` 模式均按本体轴计算）。
 pub fn frame_at(
     sensor: &SensorObject,
     satellite_ecef: [f64; 3],
     latitude_deg: f64,
     longitude_deg: f64,
     target_ecef: Option<[f64; 3]>,
+    attitude: Option<&AttitudeFrame>,
 ) -> Option<SensorFrame> {
     let (north, east) = local_axes(latitude_deg, longitude_deg);
     let nadir = normalize([-satellite_ecef[0], -satellite_ecef[1], -satellite_ecef[2]])?;
 
-    let mut boresight = match sensor.pointing_mode.as_str() {
+    let (boresight, reference) = match sensor.pointing_mode.as_str() {
+        "body" => {
+            let body = attitude?;
+            let boresight = normalize([
+                body.x[0] * sensor.body_boresight[0]
+                    + body.y[0] * sensor.body_boresight[1]
+                    + body.z[0] * sensor.body_boresight[2],
+                body.x[1] * sensor.body_boresight[0]
+                    + body.y[1] * sensor.body_boresight[1]
+                    + body.z[1] * sensor.body_boresight[2],
+                body.x[2] * sensor.body_boresight[0]
+                    + body.y[2] * sensor.body_boresight[1]
+                    + body.z[2] * sensor.body_boresight[2],
+            ])?;
+            (boresight, body.y)
+        }
         "fixed" => {
             let azimuth = sensor.fixed_azimuth_deg.to_radians();
             let off_nadir = sensor.fixed_off_nadir_deg.to_radians();
             let (sin_off, cos_off) = off_nadir.sin_cos();
             let (sin_az, cos_az) = azimuth.sin_cos();
-            let horizontal = [
-                cos_az * north[0] + sin_az * east[0],
-                cos_az * north[1] + sin_az * east[1],
-                cos_az * north[2] + sin_az * east[2],
-            ];
-            [
-                cos_off * nadir[0] + sin_off * horizontal[0],
-                cos_off * nadir[1] + sin_off * horizontal[1],
-                cos_off * nadir[2] + sin_off * horizontal[2],
-            ]
+            if let Some(body) = attitude {
+                let horizontal = [
+                    cos_az * body.x[0] + sin_az * body.y[0],
+                    cos_az * body.x[1] + sin_az * body.y[1],
+                    cos_az * body.x[2] + sin_az * body.y[2],
+                ];
+                (
+                    [
+                        cos_off * body.z[0] + sin_off * horizontal[0],
+                        cos_off * body.z[1] + sin_off * horizontal[1],
+                        cos_off * body.z[2] + sin_off * horizontal[2],
+                    ],
+                    body.y,
+                )
+            } else {
+                let horizontal = [
+                    cos_az * north[0] + sin_az * east[0],
+                    cos_az * north[1] + sin_az * east[1],
+                    cos_az * north[2] + sin_az * east[2],
+                ];
+                (
+                    [
+                        cos_off * nadir[0] + sin_off * horizontal[0],
+                        cos_off * nadir[1] + sin_off * horizontal[1],
+                        cos_off * nadir[2] + sin_off * horizontal[2],
+                    ],
+                    north,
+                )
+            }
         }
         "target" => {
             let target = target_ecef?;
             let direction = normalize(sub(target, satellite_ecef))?;
-            direction
+            (direction, attitude.map(|body| body.y).unwrap_or(north))
         }
-        _ => nadir,
+        _ => match attitude {
+            Some(body) => (body.z, body.y),
+            None => (nadir, north),
+        },
     };
-    boresight = normalize(boresight)?;
 
-    // 以"北向"构造本体上轴，接近极区时退回东向，避免退化。
+    let boresight = normalize(boresight)?;
+
+    // 以参考轴构造本体上轴，接近平行时退回到地理北/东向，避免退化。
+    let reference_dot = dot(boresight, reference);
     let north_dot = dot(boresight, north);
-    let (reference, reference_dot) = if north_dot.abs() < 0.95 {
+    let east_dot = dot(boresight, east);
+    let (reference, reference_dot) = if reference_dot.abs() < 0.95 {
+        (reference, reference_dot)
+    } else if north_dot.abs() < 0.95 {
         (north, north_dot)
     } else {
-        (east, dot(boresight, east))
+        (east, east_dot)
     };
     let up_component = [
         reference[0] - boresight[0] * reference_dot,

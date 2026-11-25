@@ -1,7 +1,13 @@
 import { getToken, request } from './http'
 
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
-export type JobKind = 'propagation' | 'access' | 'coverage' | 'environment'
+export type JobKind =
+  | 'propagation'
+  | 'access'
+  | 'coverage'
+  | 'environment'
+  | 'propagation_compare'
+  | 'link_budget'
 
 export interface Job<T = unknown> {
   id: string
@@ -47,8 +53,24 @@ export interface SensorTrack {
   horizontal_fov_deg: number
   vertical_fov_deg: number
   max_range_km: number
-  pointing_mode: 'nadir' | 'fixed' | 'target'
+  pointing_mode: 'nadir' | 'fixed' | 'target' | 'body'
   samples: SensorSample[]
+}
+
+export interface AttitudeSample {
+  t_seconds: number
+  x: [number, number, number]
+  y: [number, number, number]
+  z: [number, number, number]
+  quaternion: [number, number, number, number]
+}
+
+export interface AttitudeTrack {
+  satellite_id: string
+  name: string
+  color: string
+  mode: 'nadir' | 'sun' | 'fixed'
+  samples: AttitudeSample[]
 }
 
 export interface PropagationReport {
@@ -57,6 +79,7 @@ export interface PropagationReport {
   step_seconds: number
   satellites: SatelliteTrack[]
   sensor_tracks: SensorTrack[]
+  attitude_tracks: AttitudeTrack[]
 }
 
 export interface AccessWindow {
@@ -106,6 +129,15 @@ export interface CoveragePoint {
   covered: boolean
 }
 
+export interface CoverageSatelliteStat {
+  satellite_id: string
+  satellite_name: string
+  covered_points: number
+  coverage_ratio: number
+  total_visible_seconds: number
+  max_visible_seconds: number
+}
+
 export interface CoverageReport {
   satellite_ids: string[]
   satellite_names: string[]
@@ -117,11 +149,119 @@ export interface CoverageReport {
   grid_step_deg: number
   total_points: number
   covered_points: number
+  uncovered_points: number
+  multi_covered_points: number
   coverage_ratio: number
   average_visible_seconds: number
   max_visible_seconds: number
   total_visible_seconds: number
+  satellite_stats: CoverageSatelliteStat[]
   points: CoveragePoint[]
+}
+
+export interface CompareSample {
+  t_seconds: number
+  sgp4_longitude_deg: number
+  sgp4_latitude_deg: number
+  sgp4_altitude_km: number
+  numerical_longitude_deg: number
+  numerical_latitude_deg: number
+  numerical_altitude_km: number
+  position_difference_km: number
+  velocity_difference_km_s: number
+}
+
+export interface CompareStatistics {
+  mean_position_difference_km: number
+  max_position_difference_km: number
+  rms_position_difference_km: number
+  mean_velocity_difference_km_s: number
+  max_velocity_difference_km_s: number
+  rms_velocity_difference_km_s: number
+}
+
+export interface IntegrationStats {
+  accepted_steps: number
+  rejected_steps: number
+  min_step_seconds: number
+  max_step_seconds: number
+  mean_step_seconds: number
+}
+
+export interface PropagationCompareReport {
+  satellite_id: string
+  satellite_name: string
+  start: string
+  end: string
+  step_seconds: number
+  numerical_model: string
+  j2_enabled: boolean
+  drag_enabled: boolean
+  integration: IntegrationStats
+  statistics: CompareStatistics
+  sgp4_track: SatelliteTrack
+  numerical_track: SatelliteTrack
+  samples: CompareSample[]
+}
+
+export interface LinkOptions {
+  frequency_hz: number
+  tx_power_dbw: number
+  tx_gain_db: number
+  rx_gain_db: number
+  misc_loss_db: number
+  system_noise_temp_k: number
+  bandwidth_hz: number
+  required_cn0_dbhz: number
+}
+
+export interface LinkSample {
+  t_seconds: number
+  elevation_deg: number
+  range_km: number
+  free_space_loss_db: number
+  atmospheric_loss_db: number
+  received_power_dbw: number
+  cn0_dbhz: number
+  eb_n0_db: number
+  margin_db: number
+}
+
+export interface LinkWindow {
+  index: number
+  start_utc: string
+  end_utc: string
+  start_seconds: number
+  end_seconds: number
+  duration_seconds: number
+  min_elevation_deg: number
+  max_elevation_deg: number
+  min_range_km: number
+  max_range_km: number
+  min_margin_db: number
+  mean_margin_db: number
+  worst_elevation_deg: number
+  samples: LinkSample[]
+}
+
+export interface LinkBudgetReport {
+  satellite_id: string
+  satellite_name: string
+  ground_station_id: string
+  ground_station_name: string
+  start: string
+  end: string
+  step_seconds: number
+  frequency_hz: number
+  bandwidth_hz: number
+  required_cn0_dbhz: number
+  window_count: number
+  total_duration_seconds: number
+  min_margin_db: number
+  mean_margin_db: number
+  max_range_km: number
+  mean_free_space_loss_db: number
+  windows: LinkWindow[]
 }
 
 export interface EnvironmentSample {

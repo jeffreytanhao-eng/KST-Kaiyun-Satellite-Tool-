@@ -15,7 +15,7 @@ pub struct ScenarioData {
     pub sensors: Vec<SensorObject>,
 }
 
-/// 卫星对象：使用 TLE 描述，由后端通过 SGP4 传播。
+/// 卫星对象：使用 TLE 描述，可选择 SGP4 或数值积分传播。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SatelliteObject {
     pub id: String,
@@ -28,6 +28,39 @@ pub struct SatelliteObject {
     pub tle_line2: String,
     #[serde(default)]
     pub norad_id: Option<u64>,
+    /// 传播器类型：`sgp4`（默认）或 `numerical`（Dormand-Prince 自适应积分）。
+    #[serde(default = "default_propagator_type")]
+    pub propagator_type: String,
+    /// 姿态模式：`nadir`（对地）、`sun`（对日）或 `fixed`（轨道系固定偏置）。
+    #[serde(default = "default_attitude_mode")]
+    pub attitude_mode: String,
+    /// `fixed` 姿态模式下相对 LVLH 的滚转角（度）。
+    #[serde(default)]
+    pub attitude_roll_deg: f64,
+    /// `fixed` 姿态模式下相对 LVLH 的俯仰角（度）。
+    #[serde(default)]
+    pub attitude_pitch_deg: f64,
+    /// `fixed` 姿态模式下相对 LVLH 的偏航角（度）。
+    #[serde(default)]
+    pub attitude_yaw_deg: f64,
+    /// 质量（kg），用于大气阻力。
+    #[serde(default = "default_mass")]
+    pub mass_kg: f64,
+    /// 迎风面积（m²），用于大气阻力。
+    #[serde(default = "default_area")]
+    pub area_m2: f64,
+    /// 阻力系数。
+    #[serde(default = "default_drag_coefficient")]
+    pub drag_coefficient: f64,
+    /// 数值积分相对容差（1e-12 ~ 1e-3）。
+    #[serde(default = "default_integrator_tolerance")]
+    pub integrator_tolerance: f64,
+    /// 是否启用 J2 摄动（仅数值积分）。
+    #[serde(default = "default_true")]
+    pub enable_j2: bool,
+    /// 是否启用大气阻力（仅数值积分）。
+    #[serde(default = "default_true")]
+    pub enable_drag: bool,
 }
 
 /// 地面站对象：大地坐标与最小仰角约束。
@@ -55,6 +88,34 @@ fn default_min_elevation() -> f64 {
     5.0
 }
 
+fn default_propagator_type() -> String {
+    "sgp4".to_string()
+}
+
+fn default_attitude_mode() -> String {
+    "nadir".to_string()
+}
+
+fn default_mass() -> f64 {
+    500.0
+}
+
+fn default_area() -> f64 {
+    2.0
+}
+
+fn default_drag_coefficient() -> f64 {
+    2.2
+}
+
+fn default_integrator_tolerance() -> f64 {
+    1e-9
+}
+
+fn default_body_boresight() -> [f64; 3] {
+    [0.0, 0.0, 1.0]
+}
+
 fn default_sensor_shape() -> String {
     "conical".to_string()
 }
@@ -78,9 +139,10 @@ fn default_sensor_range() -> f64 {
 /// 卫星传感器：圆锥或矩形视场，可绑定到卫星并参与 Access 约束。
 ///
 /// 指向模式：
-/// - `nadir`：始终指向星下点；
+/// - `nadir`：始终指向星下点（有姿态时使用本体 +Z 轴）；
 /// - `fixed`：以星下点为基准，按方位角与离轴角固定指向；
-/// - `target`：指向场景内指定地面站。
+/// - `target`：指向场景内指定地面站；
+/// - `body`：按卫星真实姿态旋转本体视轴 `body_boresight`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensorObject {
     pub id: String,
@@ -100,6 +162,9 @@ pub struct SensorObject {
     pub vertical_fov_deg: f64,
     #[serde(default = "default_pointing_mode")]
     pub pointing_mode: String,
+    /// `body` 指向模式下传感器在本体坐标系中的视轴方向。
+    #[serde(default = "default_body_boresight")]
+    pub body_boresight: [f64; 3],
     #[serde(default)]
     pub fixed_azimuth_deg: f64,
     #[serde(default)]
@@ -146,6 +211,65 @@ impl ScenarioData {
             sgp4::Elements::from_tle(None, line1.as_bytes(), line2.as_bytes()).map_err(|err| {
                 AppError::BadRequest(format!("卫星 {} 的 TLE 解析失败：{err}", satellite.name))
             })?;
+
+            match satellite.propagator_type.as_str() {
+                "sgp4" | "numerical" => {}
+                other => {
+                    return Err(AppError::BadRequest(format!(
+                        "卫星 {} 的传播器类型无效：{other}",
+                        satellite.name
+                    )));
+                }
+            }
+            match satellite.attitude_mode.as_str() {
+                "nadir" | "sun" | "fixed" => {}
+                other => {
+                    return Err(AppError::BadRequest(format!(
+                        "卫星 {} 的姿态模式无效：{other}",
+                        satellite.name
+                    )));
+                }
+            }
+            for (value, label) in [
+                (satellite.attitude_roll_deg, "滚转角"),
+                (satellite.attitude_pitch_deg, "俯仰角"),
+                (satellite.attitude_yaw_deg, "偏航角"),
+            ] {
+                if !value.is_finite() || !(-180.0..=180.0).contains(&value) {
+                    return Err(AppError::BadRequest(format!(
+                        "卫星 {} 的{label}需在 [-180, 180] 度内",
+                        satellite.name
+                    )));
+                }
+            }
+            if !satellite.mass_kg.is_finite() || !(0.001..=1_000_000.0).contains(&satellite.mass_kg) {
+                return Err(AppError::BadRequest(format!(
+                    "卫星 {} 的质量需为正数且不超过 1e6 kg",
+                    satellite.name
+                )));
+            }
+            if !satellite.area_m2.is_finite() || !(0.0001..=100_000.0).contains(&satellite.area_m2) {
+                return Err(AppError::BadRequest(format!(
+                    "卫星 {} 的迎风面积需为正数且不超过 1e5 m²",
+                    satellite.name
+                )));
+            }
+            if !satellite.drag_coefficient.is_finite()
+                || !(0.01..=10.0).contains(&satellite.drag_coefficient)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "卫星 {} 的阻力系数需在 [0.01, 10] 内",
+                    satellite.name
+                )));
+            }
+            if !satellite.integrator_tolerance.is_finite()
+                || !(1e-12..=1e-3).contains(&satellite.integrator_tolerance)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "卫星 {} 的积分容差需在 [1e-12, 1e-3] 内",
+                    satellite.name
+                )));
+            }
         }
 
         let mut station_ids = HashSet::new();
@@ -253,6 +377,18 @@ impl ScenarioData {
 
             match sensor.pointing_mode.as_str() {
                 "nadir" => {}
+                "body" => {
+                    let norm = (sensor.body_boresight[0] * sensor.body_boresight[0]
+                        + sensor.body_boresight[1] * sensor.body_boresight[1]
+                        + sensor.body_boresight[2] * sensor.body_boresight[2])
+                        .sqrt();
+                    if !norm.is_finite() || norm < 1e-6 {
+                        return Err(AppError::BadRequest(format!(
+                            "传感器 {} 的本体视轴不能为零向量",
+                            sensor.name
+                        )));
+                    }
+                }
                 "fixed" => {
                     if !sensor.fixed_azimuth_deg.is_finite()
                         || !(0.0..=360.0).contains(&sensor.fixed_azimuth_deg)
