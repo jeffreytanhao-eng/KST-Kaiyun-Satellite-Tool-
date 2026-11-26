@@ -2,7 +2,15 @@
 
 基于 Web 的服务器端空间任务分析与仿真平台，对标 STK 核心能力。用户无需安装客户端，所有轨道计算在服务器完成，浏览器负责交互与三维可视化。
 
-**当前阶段：Phase 0（基础打通）已完成**，Phase 1（MVP）开发中。
+**当前阶段：Phase 5（协作与 AI 辅助）已完成**。Phase 1–4 的场景建模、Access/覆盖分析、星座/链路/雷达/报告与 AI 基础能力均已就绪。
+
+Phase 5 新增：
+
+- 场景只读/编辑共享（按用户共享，后端强制校验）与评论、审计日志；
+- 组织角色（admin / analyst / viewer）、按用户与组织的并发/每日/AI 配额，超限返回 429；
+- 任务列表（状态/进度/取消/缓存命中）与结果保留清理；
+- AI 参数建议（轨道/传感器/星座，可一键应用）与结果解读（可保存并关联任务）；
+- AI 可通过 `KST_AI_ENABLED=false` 完全关闭，核心计算不受影响。
 
 ## 核心特性
 
@@ -79,6 +87,13 @@ npm run dev
 | POST | `/api/v1/auth/login` | 用户登录，返回 JWT |
 | GET | `/api/v1/auth/me` | 获取当前用户信息 |
 | POST | `/api/v1/compute/state` | 单时刻轨道状态计算（ECI/ECEF/经纬高 + 轨道轨迹） |
+| GET/POST | `/api/v1/scenarios/{id}/shares` | 场景共享（只读/可编辑，仅创建者或管理员） |
+| GET/POST | `/api/v1/scenarios/{id}/comments` | 场景评论 |
+| GET/POST | `/api/v1/jobs` | 任务列表（状态/进度/缓存）与创建任务 |
+| POST | `/api/v1/jobs/{id}/cancel` | 取消任务 |
+| GET | `/api/v1/org/usage` | 组织配额用量 |
+| POST | `/api/v1/ai/recommend` | AI 参数建议（轨道/传感器/星座） |
+| POST | `/api/v1/ai/interpret` | AI 结果解读 |
 
 `POST /api/v1/compute/state` 请求示例：
 

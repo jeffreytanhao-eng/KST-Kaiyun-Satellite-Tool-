@@ -11,7 +11,10 @@ use serde_json::json;
 pub enum AppError {
     BadRequest(String),
     Unauthorized(&'static str),
+    Forbidden(&'static str),
     NotFound(&'static str),
+    Conflict(String),
+    TooManyRequests(String),
     Internal(String),
 }
 
@@ -20,7 +23,10 @@ impl fmt::Display for AppError {
         match self {
             AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             AppError::Unauthorized(msg) => write!(f, "unauthorized: {msg}"),
+            AppError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
             AppError::NotFound(msg) => write!(f, "not found: {msg}"),
+            AppError::Conflict(msg) => write!(f, "conflict: {msg}"),
+            AppError::TooManyRequests(msg) => write!(f, "too many requests: {msg}"),
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -35,7 +41,14 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => {
                 (StatusCode::UNAUTHORIZED, "unauthorized", msg.to_string())
             }
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.to_string()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.to_string()),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg),
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "quota_exceeded",
+                msg,
+            ),
             AppError::Internal(msg) => {
                 tracing::error!(error = %msg, "服务内部错误");
                 (

@@ -1,10 +1,13 @@
 import { request } from './http'
 
+export type UserRole = 'admin' | 'analyst' | 'viewer'
+
 export interface UserInfo {
   id: string
   username: string
   email: string | null
   org_id: string | null
+  role: UserRole
 }
 
 export interface LoginResult {

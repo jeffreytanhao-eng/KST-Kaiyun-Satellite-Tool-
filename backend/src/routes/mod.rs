@@ -7,6 +7,7 @@ mod ai;
 mod compute;
 mod constellations;
 mod jobs;
+mod orgs;
 mod scenarios;
 mod spacetrack;
 
@@ -17,6 +18,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .nest("/scenarios", scenarios::router())
         .nest("/jobs", jobs::router())
         .nest("/constellations", constellations::router())
+        .nest("/org", orgs::router())
         .layer(axum::middleware::from_fn_with_state(state, rate_limit::limit));
 
     Router::new()

@@ -90,7 +90,12 @@ export interface Scenario {
   data: ScenarioData
   created_at: string
   updated_at: string
+  owner_id: string | null
+  permission: ScenarioPermission
+  can_edit: boolean
 }
+
+export type ScenarioPermission = 'owner' | 'admin' | 'write' | 'read'
 
 export interface ScenarioSummary {
   id: string
@@ -100,6 +105,9 @@ export interface ScenarioSummary {
   ground_stations: number
   created_at: string
   updated_at: string
+  owner_id: string | null
+  permission: ScenarioPermission
+  can_edit: boolean
 }
 
 export interface ScenarioPayload {

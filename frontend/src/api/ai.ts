@@ -14,11 +14,52 @@ export interface AiConfig {
   presets: AiPreset[]
 }
 
+export interface OrbitSuggestion {
+  altitude_km?: number
+  inclination_deg?: number
+  eccentricity?: number
+}
+
+export interface SensorSuggestion {
+  shape?: 'conical' | 'rectangular'
+  half_angle_deg?: number
+  max_range_km?: number
+  pointing_mode?: 'nadir' | 'fixed' | 'target'
+}
+
+export interface ConstellationSuggestion {
+  constellation_type?: 'walker_delta' | 'walker_star' | 'streets'
+  planes?: number
+  total_satellites?: number
+  phasing?: number
+}
+
+export interface ParameterSuggestion {
+  summary?: string
+  orbit?: OrbitSuggestion
+  sensor?: SensorSuggestion
+  constellation?: ConstellationSuggestion
+  risks?: string[]
+}
+
 export interface AiResponse {
   content: string
   model: string
   latency_ms: number
   request_id: string
+  suggestion?: ParameterSuggestion | null
+}
+
+export interface AiInterpretation {
+  id: string
+  job_id: string | null
+  scenario_id: string | null
+  preset: string
+  model: string
+  content: string
+  created_by: string | null
+  username: string | null
+  created_at: string
 }
 
 export function getAiConfig() {
@@ -52,4 +93,24 @@ export function polishReport(markdown: string, locale: string) {
     method: 'POST',
     body: JSON.stringify({ markdown, locale })
   })
+}
+
+/** 保存解读结果并关联到原分析任务。 */
+export function saveInterpretation(payload: {
+  job_id: string
+  preset?: string
+  content: string
+  model?: string
+}) {
+  return request<AiInterpretation>('/ai/interpretations', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+}
+
+export function listInterpretations(jobId?: string, limit = 20) {
+  const params = new URLSearchParams()
+  if (jobId) params.set('job_id', jobId)
+  params.set('limit', String(limit))
+  return request<AiInterpretation[]>(`/ai/interpretations?${params.toString()}`)
 }

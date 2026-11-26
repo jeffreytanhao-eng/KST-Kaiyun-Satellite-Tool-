@@ -20,6 +20,12 @@ pub struct Config {
     /// Space-Track 账号（用于导入/更新 TLE；留空则视为未配置）。
     pub space_track_username: String,
     pub space_track_password: String,
+    /// 任务结果保留小时数（超期由后台清理）。
+    pub job_retention_hours: i64,
+    /// 后台清理周期（分钟）。
+    pub job_cleanup_interval_minutes: u64,
+    /// 结果缓存有效期（小时），仅复用该时间窗口内、参数与场景内容完全一致的成功结果。
+    pub job_cache_hours: i64,
 }
 
 impl Config {
@@ -62,6 +68,18 @@ impl Config {
                 .unwrap_or(60),
             space_track_username: env::var("KST_SPACETRACK_USERNAME").unwrap_or_default(),
             space_track_password: env::var("KST_SPACETRACK_PASSWORD").unwrap_or_default(),
+            job_retention_hours: env::var("KST_JOB_RETENTION_HOURS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(168),
+            job_cleanup_interval_minutes: env::var("KST_JOB_CLEANUP_INTERVAL_MINUTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(60),
+            job_cache_hours: env::var("KST_JOB_CACHE_HOURS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24),
         })
     }
 }

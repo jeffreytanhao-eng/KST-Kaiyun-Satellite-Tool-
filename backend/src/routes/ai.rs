@@ -13,13 +13,13 @@ use crate::{
     auth::AuthUser,
     environment::EnvironmentReport,
     error::AppError,
-    orbit::{AccessReport, CoverageReport},
+    link::{InterferenceReport, LinkBudgetReport},
+    orbit::{AccessReport, ConstellationAnalysisReport, CoverageReport},
+    policy::{self, actions},
+    radar::RadarReport,
     scenario::ScenarioData,
     state::AppState,
 };
-
-const JOB_SCOPE: &str =
-    "((org_id IS NOT NULL AND org_id = $1) OR (org_id IS NULL AND created_by = $2))";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -28,6 +28,10 @@ pub fn router() -> Router<AppState> {
         .route("/recommend", post(recommend))
         .route("/report", post(report))
         .route("/polish", post(polish))
+        .route(
+            "/interpretations",
+            get(list_interpretations).post(save_interpretation),
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +84,8 @@ struct AiResponse {
     model: String,
     latency_ms: i64,
     request_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<Value>,
 }
 
 struct JobSummary {
@@ -98,16 +104,26 @@ fn ensure_enabled(state: &AppState) -> Result<(), AppError> {
     }
 }
 
+/// AI 调用统一前置校验：功能开关、写入角色、每日配额。
+async fn guard_ai(state: &AppState, user: &AuthUser) -> Result<(), AppError> {
+    ensure_enabled(state)?;
+    user.require_writer()?;
+    policy::enforce_ai_quota(&state.pool, user).await?;
+    Ok(())
+}
+
 async fn load_job_summary(
     state: &AppState,
     user: &AuthUser,
     job_id: Uuid,
 ) -> Result<JobSummary, AppError> {
     let row: Option<(String, String, Option<Value>)> = sqlx::query_as(&format!(
-        "SELECT kind, status, result FROM computation_jobs WHERE id = $3 AND {JOB_SCOPE}"
+        "SELECT j.kind, j.status, j.result FROM computation_jobs j
+         WHERE j.id = $3 AND {scope}",
+        scope = policy::JOB_READ_SCOPE
     ))
-    .bind(user.org_id)
     .bind(user.id)
+    .bind(user.org_id)
     .bind(job_id)
     .fetch_optional(&state.pool)
     .await?;
@@ -134,9 +150,29 @@ async fn load_job_summary(
                 .map_err(|err| AppError::Internal(format!("环境结果解析失败：{err}")))?;
             (environment_summary(&report), "environment_interpret")
         }
+        "link_budget" => {
+            let report: LinkBudgetReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("链路结果解析失败：{err}")))?;
+            (link_summary(&report), "link_interpret")
+        }
+        "radar" => {
+            let report: RadarReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("雷达结果解析失败：{err}")))?;
+            (radar_summary(&report), "radar_interpret")
+        }
+        "constellation_analysis" => {
+            let report: ConstellationAnalysisReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("星座分析结果解析失败：{err}")))?;
+            (constellation_summary(&report), "coverage_interpret")
+        }
+        "interference" => {
+            let report: InterferenceReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("干扰结果解析失败：{err}")))?;
+            (interference_summary(&report), "link_interpret")
+        }
         _ => {
             return Err(AppError::BadRequest(
-                "仅 Access、覆盖与环境任务支持 AI 解读".into(),
+                "仅 Access、覆盖、环境、链路、雷达、星座与干扰任务支持 AI 解读".into(),
             ))
         }
     };
@@ -272,6 +308,159 @@ fn environment_summary(report: &EnvironmentReport) -> Value {
     })
 }
 
+fn link_summary(report: &LinkBudgetReport) -> Value {
+    let windows: Vec<Value> = report
+        .windows
+        .iter()
+        .take(10)
+        .map(|window| {
+            json!({
+                "index": window.index,
+                "start_utc": window.start_utc,
+                "end_utc": window.end_utc,
+                "duration_seconds": (window.duration_seconds * 10.0).round() / 10.0,
+                "min_margin_db": (window.min_margin_db * 100.0).round() / 100.0,
+                "mean_margin_db": (window.mean_margin_db * 100.0).round() / 100.0,
+                "min_range_km": (window.min_range_km * 100.0).round() / 100.0,
+                "max_range_km": (window.max_range_km * 100.0).round() / 100.0,
+            })
+        })
+        .collect();
+
+    json!({
+        "task": "link_budget",
+        "satellite": report.satellite_name,
+        "ground_station": report.ground_station_name,
+        "window": { "start": report.start, "end": report.end, "step_seconds": report.step_seconds },
+        "frequency_hz": report.frequency_hz,
+        "bandwidth_hz": report.bandwidth_hz,
+        "window_count": report.window_count,
+        "total_duration_seconds": (report.total_duration_seconds * 10.0).round() / 10.0,
+        "min_margin_db": (report.min_margin_db * 100.0).round() / 100.0,
+        "mean_margin_db": (report.mean_margin_db * 100.0).round() / 100.0,
+        "max_range_km": (report.max_range_km * 100.0).round() / 100.0,
+        "mean_free_space_loss_db": (report.mean_free_space_loss_db * 100.0).round() / 100.0,
+        "satellite_antenna_pattern": report.satellite_antenna_pattern,
+        "atmosphere_model": report.atmosphere_model,
+        "mean_atmospheric_loss_db": (report.mean_atmospheric_loss_db * 1000.0).round() / 1000.0,
+        "max_atmospheric_loss_db": (report.max_atmospheric_loss_db * 1000.0).round() / 1000.0,
+        "windows_preview": windows,
+        "window_count_truncated": report.windows.len().saturating_sub(10),
+    })
+}
+
+fn radar_summary(report: &RadarReport) -> Value {
+    let windows: Vec<Value> = report
+        .windows
+        .iter()
+        .take(10)
+        .map(|window| {
+            json!({
+                "index": window.index,
+                "start_utc": window.start_utc,
+                "end_utc": window.end_utc,
+                "duration_seconds": (window.duration_seconds * 10.0).round() / 10.0,
+                "max_snr_db": (window.max_snr_db * 100.0).round() / 100.0,
+                "detected_seconds": (window.detected_seconds * 10.0).round() / 10.0,
+                "min_range_km": (window.min_range_km * 100.0).round() / 100.0,
+                "max_range_km": (window.max_range_km * 100.0).round() / 100.0,
+            })
+        })
+        .collect();
+
+    json!({
+        "task": "radar_detection",
+        "satellite": report.satellite_name,
+        "ground_station": report.ground_station_name,
+        "window": { "start": report.start, "end": report.end, "step_seconds": report.step_seconds },
+        "frequency_hz": report.frequency_hz,
+        "bandwidth_hz": report.bandwidth_hz,
+        "tx_power_w": report.tx_power_w,
+        "required_snr_db": report.required_snr_db,
+        "integration_gain_db": (report.integration_gain_db * 100.0).round() / 100.0,
+        "max_detection_range_km": (report.max_detection_range_km * 100.0).round() / 100.0,
+        "window_count": report.window_count,
+        "detected_window_count": report.detected_window_count,
+        "total_detection_seconds": (report.total_detection_seconds * 10.0).round() / 10.0,
+        "min_range_km": (report.min_range_km * 100.0).round() / 100.0,
+        "max_range_km": (report.max_range_km * 100.0).round() / 100.0,
+        "windows_preview": windows,
+        "window_count_truncated": report.windows.len().saturating_sub(10),
+    })
+}
+
+fn constellation_summary(report: &ConstellationAnalysisReport) -> Value {
+    let stations: Vec<Value> = report
+        .station_stats
+        .iter()
+        .take(10)
+        .map(|station| {
+            json!({
+                "station": station.station_name,
+                "window_count": station.window_count,
+                "total_access_seconds": (station.total_access_seconds * 10.0).round() / 10.0,
+                "mean_gap_seconds": (station.mean_gap_seconds * 10.0).round() / 10.0,
+                "max_gap_seconds": (station.max_gap_seconds * 10.0).round() / 10.0,
+            })
+        })
+        .collect();
+
+    json!({
+        "task": "constellation_analysis",
+        "satellite_count": report.satellite_ids.len(),
+        "satellites": report.satellite_names,
+        "window": { "start": report.start, "end": report.end, "step_seconds": report.step_seconds },
+        "region_deg": {
+            "min_lat": report.region.min_latitude_deg,
+            "max_lat": report.region.max_latitude_deg,
+            "min_lon": report.region.min_longitude_deg,
+            "max_lon": report.region.max_longitude_deg
+        },
+        "grid_step_deg": report.grid_step_deg,
+        "min_elevation_deg": report.min_elevation_deg,
+        "total_points": report.total_points,
+        "covered_points": report.covered_points,
+        "coverage_ratio": (report.coverage_ratio * 10_000.0).round() / 10_000.0,
+        "multi_covered_points": report.multi_covered_points,
+        "mean_access_count": (report.mean_access_count * 100.0).round() / 100.0,
+        "mean_revisit_seconds": (report.mean_revisit_seconds * 10.0).round() / 10.0,
+        "max_gap_seconds": (report.max_gap_seconds * 10.0).round() / 10.0,
+        "station_stats": stations,
+        "note": report.note,
+    })
+}
+
+fn interference_summary(report: &InterferenceReport) -> Value {
+    let interferers: Vec<Value> = report
+        .interferers
+        .iter()
+        .take(10)
+        .map(|item| {
+            json!({
+                "satellite": item.satellite_name,
+                "min_ci_db": (item.min_ci_db * 100.0).round() / 100.0,
+                "mean_ci_db": (item.mean_ci_db * 100.0).round() / 100.0,
+                "visible_samples": item.visible_samples,
+            })
+        })
+        .collect();
+
+    json!({
+        "task": "interference_analysis",
+        "desired_satellite": report.desired_satellite_name,
+        "ground_station": report.ground_station_name,
+        "window": { "start": report.start, "end": report.end, "step_seconds": report.step_seconds },
+        "frequency_hz": report.frequency_hz,
+        "threshold_ci_db": report.threshold_ci_db,
+        "sample_count": report.sample_count,
+        "degraded_samples": report.degraded_samples,
+        "degraded_ratio": (report.degraded_ratio * 10_000.0).round() / 10_000.0,
+        "min_ci_db": (report.min_ci_db * 100.0).round() / 100.0,
+        "mean_ci_db": (report.mean_ci_db * 100.0).round() / 100.0,
+        "interferers": interferers,
+    })
+}
+
 fn scenario_summary(scenario: &ScenarioData) -> Value {
     let satellites: Vec<Value> = scenario
         .satellites
@@ -321,6 +510,137 @@ fn scenario_summary(scenario: &ScenarioData) -> Value {
         "ground_stations": stations,
         "sensors": sensors,
     })
+}
+
+fn parse_json_object(content: &str) -> Option<Value> {
+    let trimmed = content.trim();
+    let without_fence = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed);
+    let without_fence = without_fence
+        .strip_suffix("```")
+        .unwrap_or(without_fence)
+        .trim();
+    serde_json::from_str::<Value>(without_fence)
+        .ok()
+        .filter(Value::is_object)
+}
+
+fn push_line(out: &mut String, label: &str, value: &Value) {
+    if let Some(number) = value.as_f64() {
+        out.push_str(&format!("- {label}: {number}\n"));
+    } else if let Some(text) = value.as_str() {
+        out.push_str(&format!("- {label}: {text}\n"));
+    }
+}
+
+fn render_suggestion(value: &Value, english: bool) -> String {
+    let mut out = String::new();
+    if let Some(summary) = value.get("summary").and_then(Value::as_str) {
+        out.push_str(if english { "### Summary\n" } else { "### 推荐结论\n" });
+        out.push_str(summary);
+        out.push_str("\n\n");
+    }
+
+    if let Some(orbit) = value.get("orbit").filter(|item| item.is_object()) {
+        out.push_str(if english {
+            "### Orbit parameters\n"
+        } else {
+            "### 轨道参数\n"
+        });
+        push_line(
+            &mut out,
+            if english { "Altitude (km)" } else { "轨道高度 (km)" },
+            &orbit["altitude_km"],
+        );
+        push_line(
+            &mut out,
+            if english { "Inclination (deg)" } else { "倾角 (deg)" },
+            &orbit["inclination_deg"],
+        );
+        push_line(
+            &mut out,
+            if english { "Eccentricity" } else { "偏心率" },
+            &orbit["eccentricity"],
+        );
+        out.push('\n');
+    }
+
+    if let Some(sensor) = value.get("sensor").filter(|item| item.is_object()) {
+        out.push_str(if english {
+            "### Sensor parameters\n"
+        } else {
+            "### 传感器参数\n"
+        });
+        push_line(
+            &mut out,
+            if english { "Shape" } else { "视场形状" },
+            &sensor["shape"],
+        );
+        push_line(
+            &mut out,
+            if english { "Half angle (deg)" } else { "半视场角 (deg)" },
+            &sensor["half_angle_deg"],
+        );
+        push_line(
+            &mut out,
+            if english { "Max range (km)" } else { "最大作用距离 (km)" },
+            &sensor["max_range_km"],
+        );
+        push_line(
+            &mut out,
+            if english { "Pointing mode" } else { "指向模式" },
+            &sensor["pointing_mode"],
+        );
+        out.push('\n');
+    }
+
+    if let Some(constellation) = value.get("constellation").filter(|item| item.is_object()) {
+        out.push_str(if english {
+            "### Constellation parameters\n"
+        } else {
+            "### 星座参数\n"
+        });
+        push_line(
+            &mut out,
+            if english { "Pattern" } else { "构型" },
+            &constellation["constellation_type"],
+        );
+        push_line(
+            &mut out,
+            if english { "Planes" } else { "轨道面数" },
+            &constellation["planes"],
+        );
+        push_line(
+            &mut out,
+            if english { "Total satellites" } else { "卫星总数" },
+            &constellation["total_satellites"],
+        );
+        push_line(
+            &mut out,
+            if english { "Phasing" } else { "相位因子" },
+            &constellation["phasing"],
+        );
+        out.push('\n');
+    }
+
+    if let Some(risks) = value.get("risks").and_then(Value::as_array) {
+        if !risks.is_empty() {
+            out.push_str(if english { "### Risks\n" } else { "### 风险提示\n" });
+            for risk in risks {
+                if let Some(text) = risk.as_str() {
+                    out.push_str(&format!("- {text}\n"));
+                }
+            }
+        }
+    }
+
+    if out.trim().is_empty() {
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    } else {
+        out
+    }
 }
 
 fn language_instruction(locale: Option<&str>) -> &'static str {
@@ -391,7 +711,7 @@ async fn interpret(
     user: AuthUser,
     Json(payload): Json<InterpretRequest>,
 ) -> Result<Json<AiResponse>, AppError> {
-    ensure_enabled(&state)?;
+    guard_ai(&state, &user).await?;
     let summary = load_job_summary(&state, &user, payload.job_id).await?;
     let request_id = record_start(
         &state,
@@ -423,6 +743,7 @@ async fn interpret(
                 model: state.ai.model().to_string(),
                 latency_ms,
                 request_id: request_id.unwrap_or_else(Uuid::nil),
+                suggestion: None,
             }))
         }
         Err(error) => {
@@ -437,7 +758,7 @@ async fn recommend(
     user: AuthUser,
     Json(payload): Json<RecommendRequest>,
 ) -> Result<Json<AiResponse>, AppError> {
-    ensure_enabled(&state)?;
+    guard_ai(&state, &user).await?;
     let objective = payload.objective.trim();
     if objective.is_empty() {
         return Err(AppError::BadRequest("请填写任务目标".into()));
@@ -471,25 +792,31 @@ async fn recommend(
 
     let english = language_instruction(payload.locale.as_deref()).starts_with("Please");
     let system = if english {
-        "You are a senior space mission architect. Recommend concrete orbit altitude, inclination, sensor FOV and pointing parameters, with trade-offs and risks. Do not invent TLE data."
+        "You are a senior space mission architect. Return ONLY a single JSON object, no Markdown, no explanation. Schema: {\"summary\": string, \"orbit\": {\"altitude_km\": number, \"inclination_deg\": number, \"eccentricity\": number}, \"sensor\": {\"shape\": \"conical\"|\"rectangular\", \"half_angle_deg\": number, \"max_range_km\": number, \"pointing_mode\": \"nadir\"|\"fixed\"|\"target\"}, \"constellation\": {\"constellation_type\": \"walker_delta\"|\"walker_star\"|\"streets\", \"planes\": integer, \"total_satellites\": integer, \"phasing\": integer}, \"risks\": [string]}. Do not invent TLE data."
     } else {
-        "你是一位资深航天任务总体设计师。请给出具体的轨道高度、倾角、传感器视场与指向参数建议，并说明权衡与风险。不要编造 TLE 数据。"
+        "你是一位资深航天任务总体设计师。只返回一个 JSON 对象，不要输出 Markdown 代码块或解释。结构为：{\"summary\": \"一句话结论\", \"orbit\": {\"altitude_km\": 数值, \"inclination_deg\": 数值, \"eccentricity\": 数值}, \"sensor\": {\"shape\": \"conical\" 或 \"rectangular\", \"half_angle_deg\": 数值, \"max_range_km\": 数值, \"pointing_mode\": \"nadir\" 或 \"fixed\" 或 \"target\"}, \"constellation\": {\"constellation_type\": \"walker_delta\" 或 \"walker_star\" 或 \"streets\", \"planes\": 整数, \"total_satellites\": 整数, \"phasing\": 整数}, \"risks\": [\"风险\"]}。不要编造 TLE 数据。"
     };
     let user_prompt = format!(
-        "{}\n\n任务目标：{}\n\n当前场景对象摘要（JSON）：\n```json\n{}\n```\n\n请输出：1) 推荐结论；2) 参数建议表；3) 依据；4) 风险与验证建议。",
+        "{}\n\n任务目标：{}\n\n当前场景对象摘要（JSON）：\n```json\n{}\n```\n\n请基于任务目标与当前场景给出可直接应用的参数建议，数值必须合理且落在工程可行范围内。",
         language_instruction(payload.locale.as_deref()),
         objective,
         serde_json::to_string_pretty(&scenario_summary(&scenario)).unwrap_or_default()
     );
 
-    match state.ai.complete(system, &user_prompt).await {
+    match state.ai.complete_json(system, &user_prompt).await {
         Ok((content, latency_ms)) => {
             record_finish(&state, request_id, None, Some(latency_ms)).await;
+            let suggestion = parse_json_object(&content);
+            let rendered = match suggestion.as_ref() {
+                Some(value) => render_suggestion(value, english),
+                None => content.clone(),
+            };
             Ok(Json(AiResponse {
-                content,
+                content: rendered,
                 model: state.ai.model().to_string(),
                 latency_ms,
                 request_id: request_id.unwrap_or_else(Uuid::nil),
+                suggestion,
             }))
         }
         Err(error) => {
@@ -504,7 +831,7 @@ async fn report(
     user: AuthUser,
     Json(payload): Json<ReportRequest>,
 ) -> Result<Json<AiResponse>, AppError> {
-    ensure_enabled(&state)?;
+    guard_ai(&state, &user).await?;
     let summary = load_job_summary(&state, &user, payload.job_id).await?;
     let request_id = record_start(
         &state,
@@ -537,6 +864,7 @@ async fn report(
                 model: state.ai.model().to_string(),
                 latency_ms,
                 request_id: request_id.unwrap_or_else(Uuid::nil),
+                suggestion: None,
             }))
         }
         Err(error) => {
@@ -551,7 +879,7 @@ async fn polish(
     user: AuthUser,
     Json(payload): Json<PolishRequest>,
 ) -> Result<Json<AiResponse>, AppError> {
-    ensure_enabled(&state)?;
+    guard_ai(&state, &user).await?;
     let markdown = payload.markdown.trim();
     if markdown.is_empty() {
         return Err(AppError::BadRequest("待润色的报告内容为空".into()));
@@ -591,6 +919,7 @@ async fn polish(
                 model: state.ai.model().to_string(),
                 latency_ms,
                 request_id: request_id.unwrap_or_else(Uuid::nil),
+                suggestion: None,
             }))
         }
         Err(error) => {
@@ -611,4 +940,158 @@ struct AiRequestView {
     error: Option<String>,
     latency_ms: Option<i32>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveInterpretationRequest {
+    job_id: Uuid,
+    #[serde(default)]
+    preset: String,
+    content: String,
+    #[serde(default)]
+    model: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InterpretationQuery {
+    job_id: Option<Uuid>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct InterpretationView {
+    id: Uuid,
+    job_id: Option<Uuid>,
+    scenario_id: Option<Uuid>,
+    preset: String,
+    model: String,
+    content: String,
+    created_by: Option<Uuid>,
+    username: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+const INTERPRETATION_COLUMNS: &str = "i.id, i.job_id, i.scenario_id, i.preset, i.model, i.content,
+     i.created_by, u.username, i.created_at";
+
+async fn job_visible(state: &AppState, user: &AuthUser, job_id: Uuid) -> Result<bool, AppError> {
+    let row: Option<(Uuid,)> = sqlx::query_as(&format!(
+        "SELECT j.id FROM computation_jobs j WHERE j.id = $3 AND {scope}",
+        scope = policy::JOB_READ_SCOPE
+    ))
+    .bind(user.id)
+    .bind(user.org_id)
+    .bind(job_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn save_interpretation(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(payload): Json<SaveInterpretationRequest>,
+) -> Result<Json<InterpretationView>, AppError> {
+    user.require_writer()?;
+    if payload.content.trim().is_empty() {
+        return Err(AppError::BadRequest("解读内容为空".into()));
+    }
+    if !job_visible(&state, &user, payload.job_id).await? {
+        return Err(AppError::NotFound("任务不存在"));
+    }
+
+    let job: (Uuid, String, Option<Uuid>) = sqlx::query_as(
+        "SELECT scenario_id, kind, org_id FROM computation_jobs WHERE id = $1",
+    )
+    .bind(payload.job_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let (scenario_id, kind, org_id) = job;
+    let preset = if payload.preset.trim().is_empty() {
+        format!("{kind}_interpret")
+    } else {
+        payload.preset.trim().to_string()
+    };
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ai_interpretations
+            (id, org_id, created_by, job_id, scenario_id, preset, model, content)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(id)
+    .bind(org_id.or(user.org_id))
+    .bind(user.id)
+    .bind(payload.job_id)
+    .bind(scenario_id)
+    .bind(&preset)
+    .bind(payload.model.trim())
+    .bind(payload.content.trim())
+    .execute(&state.pool)
+    .await?;
+
+    policy::audit(
+        &state.pool,
+        &user,
+        actions::INTERPRETATION_SAVE,
+        "job",
+        Some(payload.job_id),
+        serde_json::json!({ "interpretation_id": id, "preset": preset }),
+    )
+    .await;
+
+    let row: InterpretationView = sqlx::query_as(&format!(
+        "SELECT {INTERPRETATION_COLUMNS}
+         FROM ai_interpretations i
+         LEFT JOIN users u ON u.id = i.created_by
+         WHERE i.id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(row))
+}
+
+async fn list_interpretations(
+    State(state): State<AppState>,
+    user: AuthUser,
+    axum::extract::Query(query): axum::extract::Query<InterpretationQuery>,
+) -> Result<Json<Vec<InterpretationView>>, AppError> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+
+    let rows: Vec<InterpretationView> = if let Some(job_id) = query.job_id {
+        if !job_visible(&state, &user, job_id).await? {
+            return Err(AppError::NotFound("任务不存在"));
+        }
+        sqlx::query_as(&format!(
+            "SELECT {INTERPRETATION_COLUMNS}
+             FROM ai_interpretations i
+             LEFT JOIN users u ON u.id = i.created_by
+             WHERE i.job_id = $1
+             ORDER BY i.created_at DESC
+             LIMIT $2"
+        ))
+        .bind(job_id)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        sqlx::query_as(&format!(
+            "SELECT {INTERPRETATION_COLUMNS}
+             FROM ai_interpretations i
+             LEFT JOIN users u ON u.id = i.created_by
+             WHERE i.created_by = $1 OR (i.org_id IS NOT NULL AND i.org_id = $2)
+             ORDER BY i.created_at DESC
+             LIMIT $3"
+        ))
+        .bind(user.id)
+        .bind(user.org_id)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await?
+    };
+
+    Ok(Json(rows))
 }

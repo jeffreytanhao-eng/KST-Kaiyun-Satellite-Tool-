@@ -2,12 +2,13 @@ use axum::{
     extract::{Path, Query, State},
     http::header,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -19,20 +20,25 @@ use crate::{
         self, AccessOptions, AccessReport, ConstellationAnalysisReport, CoverageRegion,
         CoverageReport, PropagationCompareReport,
     },
+    policy::{self, actions},
     radar::{self, RadarOptions, RadarReport},
     report::{self, ReportDocument, ReportRequest},
     scenario::ScenarioData,
     state::AppState,
 };
 
-const SCOPE: &str =
-    "((org_id IS NOT NULL AND org_id = $1) OR (org_id IS NULL AND created_by = $2))";
 const MAX_SAMPLES: f64 = 20_000.0;
+
+const JOB_COLUMNS: &str = "id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at, progress, cached, cancel_requested, cache_key";
+
+/// 列表查询不返回 params/result 等大字段，避免轮询时反复传输与序列化兆级 JSON。
+const JOB_SUMMARY_COLUMNS: &str = "id, scenario_id, kind, status, error, created_at, started_at, finished_at, progress, cached, cancel_requested";
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_jobs).post(create_job))
         .route("/{id}", get(get_job))
+        .route("/{id}/cancel", post(cancel_job))
         .route("/{id}/csv", get(job_csv))
         .route("/{id}/report", get(job_report))
 }
@@ -49,6 +55,10 @@ struct JobRow {
     created_at: DateTime<Utc>,
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
+    progress: i32,
+    cached: bool,
+    cancel_requested: bool,
+    cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +73,58 @@ struct JobView {
     created_at: DateTime<Utc>,
     started_at: Option<DateTime<Utc>>,
     finished_at: Option<DateTime<Utc>>,
+    progress: i32,
+    cached: bool,
+    cancel_requested: bool,
+    cache_key: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct JobSummaryRow {
+    id: Uuid,
+    scenario_id: Uuid,
+    kind: String,
+    status: String,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    progress: i32,
+    cached: bool,
+    cancel_requested: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct JobSummaryView {
+    id: Uuid,
+    scenario_id: Uuid,
+    kind: String,
+    status: String,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    progress: i32,
+    cached: bool,
+    cancel_requested: bool,
+}
+
+impl JobSummaryRow {
+    fn into_view(self) -> JobSummaryView {
+        JobSummaryView {
+            id: self.id,
+            scenario_id: self.scenario_id,
+            kind: self.kind,
+            status: self.status,
+            error: self.error,
+            created_at: self.created_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            progress: self.progress,
+            cached: self.cached,
+            cancel_requested: self.cancel_requested,
+        }
+    }
 }
 
 impl JobRow {
@@ -78,6 +140,10 @@ impl JobRow {
             created_at: self.created_at,
             started_at: self.started_at,
             finished_at: self.finished_at,
+            progress: self.progress,
+            cached: self.cached,
+            cancel_requested: self.cancel_requested,
+            cache_key: self.cache_key,
         }
     }
 }
@@ -93,6 +159,10 @@ struct CreateJobRequest {
 #[derive(Debug, Deserialize)]
 struct JobQuery {
     scenario_id: Option<Uuid>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,20 +472,33 @@ fn validate_params(kind: &str, params: &Value) -> Result<(), AppError> {
     }
 }
 
-async fn scenario_exists(
-    state: &AppState,
-    user: &AuthUser,
-    scenario_id: Uuid,
-) -> Result<bool, AppError> {
-    let exists: Option<Uuid> = sqlx::query_scalar(&format!(
-        "SELECT id FROM scenarios WHERE id = $3 AND {SCOPE}"
+fn canonical_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+/// 缓存键严格绑定任务类型、参数与场景内容，避免错误复用。
+fn compute_cache_key(kind: &str, params: &Value, scenario_data: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update(b"|params|");
+    hasher.update(canonical_json(params).as_bytes());
+    hasher.update(b"|scenario|");
+    hasher.update(canonical_json(scenario_data).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+async fn fetch_job(state: &AppState, user: &AuthUser, id: Uuid) -> Result<JobRow, AppError> {
+    let row: Option<JobRow> = sqlx::query_as(&format!(
+        "SELECT {JOB_COLUMNS} FROM computation_jobs j
+         WHERE j.id = $3 AND {scope}",
+        scope = policy::JOB_READ_SCOPE
     ))
-    .bind(user.org_id)
     .bind(user.id)
-    .bind(scenario_id)
+    .bind(user.org_id)
+    .bind(id)
     .fetch_optional(&state.pool)
     .await?;
-    Ok(exists.is_some())
+    row.ok_or(AppError::NotFound("任务不存在"))
 }
 
 async fn create_job(
@@ -423,15 +506,66 @@ async fn create_job(
     user: AuthUser,
     Json(payload): Json<CreateJobRequest>,
 ) -> Result<Json<JobView>, AppError> {
-    if !scenario_exists(&state, &user, payload.scenario_id).await? {
-        return Err(AppError::NotFound("场景不存在"));
+    user.require_writer()?;
+    let access = policy::scenario_access(&state.pool, &user, payload.scenario_id).await?;
+    if !access.can_write {
+        return Err(AppError::Forbidden("对该场景只有只读权限，无法创建计算任务"));
     }
     validate_params(&payload.kind, &payload.params)?;
+    policy::enforce_job_quota(&state.pool, &user).await?;
+
+    let data: Option<Value> = sqlx::query_scalar("SELECT data FROM scenarios WHERE id = $1")
+        .bind(payload.scenario_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let data = data.ok_or(AppError::NotFound("场景不存在"))?;
+    let cache_key = compute_cache_key(&payload.kind, &payload.params, &data);
+
+    // 结果缓存：仅复用有效期内、参数与场景内容完全一致的成功结果。
+    let cached: Option<(Uuid, Value)> = sqlx::query_as(
+        "SELECT id, result FROM computation_jobs
+         WHERE org_id IS NOT DISTINCT FROM $1
+           AND cache_key = $2
+           AND status = 'succeeded'
+           AND result IS NOT NULL
+           AND finished_at > now() - make_interval(hours => $3)
+         ORDER BY finished_at DESC
+         LIMIT 1",
+    )
+    .bind(user.org_id)
+    .bind(&cache_key)
+    .bind(state.config.job_cache_hours.max(1) as i32)
+    .fetch_optional(&state.pool)
+    .await?;
 
     let job_id = Uuid::new_v4();
+    if let Some((source_id, result)) = cached {
+        sqlx::query(
+            "INSERT INTO computation_jobs
+                (id, org_id, created_by, scenario_id, kind, status, params, result, progress,
+                 cached, cache_key, cache_source_id, started_at, finished_at)
+             VALUES ($1, $2, $3, $4, $5, 'succeeded', $6, $7, 100, TRUE, $8, $9, now(), now())",
+        )
+        .bind(job_id)
+        .bind(user.org_id)
+        .bind(user.id)
+        .bind(payload.scenario_id)
+        .bind(&payload.kind)
+        .bind(&payload.params)
+        .bind(result)
+        .bind(&cache_key)
+        .bind(source_id)
+        .execute(&state.pool)
+        .await?;
+
+        let row = fetch_job(&state, &user, job_id).await?;
+        return Ok(Json(row.into_view()));
+    }
+
     sqlx::query(
-        "INSERT INTO computation_jobs (id, org_id, created_by, scenario_id, kind, status, params)
-         VALUES ($1, $2, $3, $4, $5, 'queued', $6)",
+        "INSERT INTO computation_jobs
+            (id, org_id, created_by, scenario_id, kind, status, params, progress, cache_key)
+         VALUES ($1, $2, $3, $4, $5, 'queued', $6, 0, $7)",
     )
     .bind(job_id)
     .bind(user.org_id)
@@ -439,6 +573,7 @@ async fn create_job(
     .bind(payload.scenario_id)
     .bind(&payload.kind)
     .bind(&payload.params)
+    .bind(&cache_key)
     .execute(&state.pool)
     .await?;
 
@@ -447,14 +582,7 @@ async fn create_job(
         execute_job(background, job_id).await;
     });
 
-    let row: JobRow = sqlx::query_as(
-        "SELECT id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at
-         FROM computation_jobs WHERE id = $1",
-    )
-    .bind(job_id)
-    .fetch_one(&state.pool)
-    .await?;
-
+    let row = fetch_job(&state, &user, job_id).await?;
     Ok(Json(row.into_view()))
 }
 
@@ -462,21 +590,28 @@ async fn list_jobs(
     State(state): State<AppState>,
     user: AuthUser,
     Query(query): Query<JobQuery>,
-) -> Result<Json<Vec<JobView>>, AppError> {
-    let rows: Vec<JobRow> = sqlx::query_as(&format!(
-        "SELECT id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at
-         FROM computation_jobs
-         WHERE {SCOPE} AND ($3::uuid IS NULL OR scenario_id = $3)
-         ORDER BY created_at DESC
-         LIMIT 50"
+) -> Result<Json<Vec<JobSummaryView>>, AppError> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let rows: Vec<JobSummaryRow> = sqlx::query_as(&format!(
+        "SELECT {JOB_SUMMARY_COLUMNS} FROM computation_jobs j
+         WHERE {scope}
+           AND ($3::uuid IS NULL OR j.scenario_id = $3)
+           AND ($4::text IS NULL OR j.status = $4)
+         ORDER BY j.created_at DESC
+         LIMIT $5",
+        scope = policy::JOB_READ_SCOPE
     ))
-    .bind(user.org_id)
     .bind(user.id)
+    .bind(user.org_id)
     .bind(query.scenario_id)
+    .bind(query.status.as_deref())
+    .bind(limit)
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(Json(rows.into_iter().map(JobRow::into_view).collect()))
+    Ok(Json(
+        rows.into_iter().map(JobSummaryRow::into_view).collect(),
+    ))
 }
 
 async fn get_job(
@@ -484,17 +619,63 @@ async fn get_job(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<JobView>, AppError> {
-    let row: Option<JobRow> = sqlx::query_as(&format!(
-        "SELECT id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at
-         FROM computation_jobs WHERE id = $3 AND {SCOPE}"
-    ))
-    .bind(user.org_id)
-    .bind(user.id)
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let row = fetch_job(&state, &user, id).await?;
+    Ok(Json(row.into_view()))
+}
 
-    let row = row.ok_or(AppError::NotFound("任务不存在"))?;
+async fn cancel_job(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JobView>, AppError> {
+    user.require_writer()?;
+    let row = fetch_job(&state, &user, id).await?;
+
+    let owner: Option<(Option<Uuid>, Option<Uuid>)> =
+        sqlx::query_as("SELECT created_by, org_id FROM computation_jobs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let (creator, job_org) = owner.ok_or(AppError::NotFound("任务不存在"))?;
+    let allowed = creator == Some(user.id)
+        || (user.is_admin() && job_org.is_some() && job_org == user.org_id);
+    if !allowed {
+        return Err(AppError::Forbidden("仅任务创建者或管理员可取消任务"));
+    }
+
+    if matches!(row.status.as_str(), "succeeded" | "failed" | "cancelled") {
+        return Err(AppError::Conflict("任务已结束，无法取消".into()));
+    }
+
+    if row.status == "queued" {
+        sqlx::query(
+            "UPDATE computation_jobs
+             SET status = 'cancelled', cancel_requested = TRUE, cancelled_at = now(), finished_at = now()
+             WHERE id = $1 AND status = 'queued'",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE computation_jobs SET cancel_requested = TRUE WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    policy::audit(
+        &state.pool,
+        &user,
+        actions::JOB_CANCEL,
+        "job",
+        Some(id),
+        json!({ "status": row.status }),
+    )
+    .await;
+
+    let row = fetch_job(&state, &user, id).await?;
     Ok(Json(row.into_view()))
 }
 
@@ -503,17 +684,7 @@ async fn job_csv(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Response, AppError> {
-    let row: Option<JobRow> = sqlx::query_as(&format!(
-        "SELECT id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at
-         FROM computation_jobs WHERE id = $3 AND {SCOPE}"
-    ))
-    .bind(user.org_id)
-    .bind(user.id)
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let row = row.ok_or(AppError::NotFound("任务不存在"))?;
+    let row = fetch_job(&state, &user, id).await?;
     if row.status != "succeeded" {
         return Err(AppError::BadRequest("任务尚未完成，无法导出".into()));
     }
@@ -599,17 +770,7 @@ async fn job_report(
     Path(id): Path<Uuid>,
     Query(query): Query<ReportDownloadQuery>,
 ) -> Result<Response, AppError> {
-    let row: Option<JobRow> = sqlx::query_as(&format!(
-        "SELECT id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at
-         FROM computation_jobs WHERE id = $3 AND {SCOPE}"
-    ))
-    .bind(user.org_id)
-    .bind(user.id)
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let row = row.ok_or(AppError::NotFound("任务不存在"))?;
+    let row = fetch_job(&state, &user, id).await?;
     if row.status != "succeeded" {
         return Err(AppError::BadRequest("任务尚未完成，无法导出报告".into()));
     }
@@ -772,22 +933,50 @@ async fn execute_job(state: AppState, job_id: Uuid) {
     }
 }
 
-async fn run_job(state: AppState, job_id: Uuid) -> Result<(), String> {
-    let row: Option<JobRow> = sqlx::query_as(
-        "SELECT id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at
-         FROM computation_jobs WHERE id = $1",
+async fn set_progress(state: &AppState, job_id: Uuid, value: i32) {
+    let _ = sqlx::query(
+        "UPDATE computation_jobs SET progress = $2 WHERE id = $1 AND status = 'running'",
     )
+    .bind(job_id)
+    .bind(value)
+    .execute(&state.pool)
+    .await;
+}
+
+async fn run_job(state: AppState, job_id: Uuid) -> Result<(), String> {
+    // 仅由 queued 状态抢占执行，避免重复执行或执行已取消任务。
+    let claimed = sqlx::query(
+        "UPDATE computation_jobs
+         SET status = 'running', started_at = now(), progress = 10
+         WHERE id = $1 AND status = 'queued' AND cancel_requested = FALSE",
+    )
+    .bind(job_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|err| err.to_string())?;
+    if claimed.rows_affected() == 0 {
+        let _ = sqlx::query(
+            "UPDATE computation_jobs
+             SET status = 'cancelled', cancelled_at = COALESCE(cancelled_at, now()),
+                 finished_at = COALESCE(finished_at, now())
+             WHERE id = $1 AND status = 'queued'",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await;
+        return Ok(());
+    }
+
+    let row: Option<JobRow> = sqlx::query_as(&format!(
+        "SELECT {JOB_COLUMNS} FROM computation_jobs WHERE id = $1"
+    ))
     .bind(job_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|err| err.to_string())?;
     let row = row.ok_or_else(|| "任务不存在".to_string())?;
 
-    sqlx::query("UPDATE computation_jobs SET status = 'running', started_at = now() WHERE id = $1")
-        .bind(job_id)
-        .execute(&state.pool)
-        .await
-        .map_err(|err| err.to_string())?;
+    set_progress(&state, job_id, 25).await;
 
     let data: Option<Value> = sqlx::query_scalar("SELECT data FROM scenarios WHERE id = $1")
         .bind(row.scenario_id)
@@ -805,9 +994,32 @@ async fn run_job(state: AppState, job_id: Uuid) -> Result<(), String> {
         .await
         .map_err(|err| format!("任务线程异常：{err}"))??;
 
+    set_progress(&state, job_id, 85).await;
+
+    // 计算完成后若用户已请求取消，则丢弃结果。
+    let cancel_requested: Option<bool> =
+        sqlx::query_scalar("SELECT cancel_requested FROM computation_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|err| err.to_string())?;
+    if cancel_requested == Some(true) {
+        sqlx::query(
+            "UPDATE computation_jobs
+             SET status = 'cancelled', result = NULL, progress = 100,
+                 cancelled_at = now(), finished_at = now()
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
+
     sqlx::query(
         "UPDATE computation_jobs
-         SET status = 'succeeded', result = $2, error = NULL, finished_at = now()
+         SET status = 'succeeded', result = $2, error = NULL, progress = 100, finished_at = now()
          WHERE id = $1",
     )
     .bind(job_id)

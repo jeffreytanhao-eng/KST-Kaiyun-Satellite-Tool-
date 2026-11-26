@@ -23,7 +23,7 @@ pub struct AiPreset {
     pub description_en: &'static str,
 }
 
-pub const PRESETS: [AiPreset; 4] = [
+pub const PRESETS: [AiPreset; 6] = [
     AiPreset {
         id: "access_interpret",
         name: "解读 Access 结果",
@@ -44,6 +44,20 @@ pub const PRESETS: [AiPreset; 4] = [
         name_en: "Interpret atmospheric impact",
         description: "分析密度、阻力与高度衰减对轨道寿命的影响。",
         description_en: "Analyze density, drag and altitude decay effects.",
+    },
+    AiPreset {
+        id: "link_interpret",
+        name: "解读链路预算",
+        name_en: "Interpret link budget",
+        description: "分析余量、自由空间损耗与大气衰减，指出链路薄弱时段。",
+        description_en: "Analyze link margin, free-space loss and atmospheric attenuation.",
+    },
+    AiPreset {
+        id: "radar_interpret",
+        name: "解读雷达探测",
+        name_en: "Interpret radar detection",
+        description: "分析探测距离、信噪比与可见时段，评估发现能力。",
+        description_en: "Analyze detection range, SNR and visibility windows.",
     },
     AiPreset {
         id: "orbit_recommend",
@@ -69,6 +83,9 @@ struct ChatChoice {
 struct ChatMessage {
     #[serde(default)]
     content: Option<String>,
+    /// 部分推理模型仅返回 reasoning_content，content 为空，作为兜底避免误判为响应为空。
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 impl AiClient {
@@ -106,23 +123,47 @@ impl AiClient {
 
     /// 调用 Chat Completions 并返回（正文, 耗时毫秒）。
     pub async fn complete(&self, system: &str, user: &str) -> Result<(String, i64), String> {
+        self.complete_inner(system, user, false).await
+    }
+
+    /// 要求模型返回 JSON 对象（部分兼容服务会忽略该提示，调用方仍需容错解析）。
+    pub async fn complete_json(&self, system: &str, user: &str) -> Result<(String, i64), String> {
+        self.complete_inner(system, user, true).await
+    }
+
+    async fn complete_inner(
+        &self,
+        system: &str,
+        user: &str,
+        json_mode: bool,
+    ) -> Result<(String, i64), String> {
         if !self.enabled {
             return Err("AI 功能未启用，请在后端配置 KST_AI_API_KEY 与 KST_AI_MODEL".into());
         }
         let started = std::time::Instant::now();
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4096
+        });
+        if json_mode {
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "response_format".to_string(),
+                    serde_json::json!({ "type": "json_object" }),
+                );
+            }
+        }
+
         let response = self
             .http
             .post(self.endpoint())
             .bearer_auth(&self.api_key)
-            .json(&serde_json::json!({
-                "model": self.model,
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": user }
-                ],
-                "temperature": 0.3,
-                "max_tokens": 1600
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|err| {
@@ -145,10 +186,15 @@ impl AiClient {
 
         let parsed: ChatResponse =
             serde_json::from_str(&body).map_err(|err| format!("AI 响应解析失败：{err}"))?;
-        let content = parsed
+        let message = parsed
             .choices
             .first()
-            .and_then(|choice| choice.message.content.as_deref())
+            .map(|choice| &choice.message)
+            .ok_or_else(|| "AI 响应为空".to_string())?;
+        let content = message
+            .content
+            .as_deref()
+            .or(message.reasoning_content.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "AI 响应为空".to_string())?

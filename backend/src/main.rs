@@ -9,6 +9,7 @@ mod error;
 mod link;
 mod numerical;
 mod orbit;
+mod policy;
 mod radar;
 mod rate_limit;
 mod report;
@@ -45,6 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tracing::warn!("未设置 KST_ADMIN_PASSWORD，跳过初始管理员创建");
     }
+
+    db::spawn_job_cleanup(
+        pool.clone(),
+        config.job_retention_hours,
+        config.job_cleanup_interval_minutes,
+    );
 
     let auth = auth::AuthService::new(config.jwt_secret.clone(), config.jwt_ttl_hours);
     let space = space::SpaceContext::new()?;

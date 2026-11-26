@@ -8,15 +8,28 @@ import {
   getAiConfig,
   interpretJob,
   recommendScenario,
+  saveInterpretation,
   type AiConfig,
   type AiResponse
 } from '@/api/ai'
+import { generateConstellation } from '@/api/constellations'
+import { useAuthStore } from '@/stores/auth'
 import { useScenarioStore } from '@/stores/scenario'
 import { useI18n } from '@/i18n'
 
-type Action = 'interpret' | 'recommend' | 'report'
+type Action = 'interpret' | 'recommend' | 'report' | 'apply' | 'save'
+type JobKey =
+  | 'access'
+  | 'coverage'
+  | 'environment'
+  | 'link'
+  | 'radar'
+  | 'constellation'
+  | 'interference'
+  | 'report'
 
 const store = useScenarioStore()
+const auth = useAuthStore()
 const { t, locale } = useI18n()
 
 const props = defineProps<{ active?: boolean }>()
@@ -25,9 +38,12 @@ const config = ref<AiConfig | null>(null)
 const configLoading = ref(false)
 const busy = ref<Action | null>(null)
 const objective = ref('')
-const selectedJobKey = ref<'access' | 'coverage' | 'environment'>('access')
+const selectedJobKey = ref<JobKey>('access')
 const output = ref<AiResponse | null>(null)
 const lastAction = ref<Action>('interpret')
+
+const canWrite = computed(() => auth.user?.role !== 'viewer')
+const suggestion = computed(() => output.value?.suggestion ?? null)
 
 const presets = computed(() => {
   const english = locale.value === 'en'
@@ -38,17 +54,21 @@ const presets = computed(() => {
   }))
 })
 
-const jobOptions = computed<{ key: 'access' | 'coverage' | 'environment'; label: string; id: string }[]>(() => {
-  const options: { key: 'access' | 'coverage' | 'environment'; label: string; id: string }[] = []
-  if (store.accessJob?.status === 'succeeded') {
-    options.push({ key: 'access', label: t('aiJobAccess'), id: store.accessJob.id })
+const jobOptions = computed<{ key: JobKey; label: string; id: string }[]>(() => {
+  const options: { key: JobKey; label: string; id: string }[] = []
+  const push = (key: JobKey, labelKey: string, job: { status: string; id: string } | null) => {
+    if (job?.status === 'succeeded') {
+      options.push({ key, label: t(labelKey as Parameters<typeof t>[0]), id: job.id })
+    }
   }
-  if (store.coverageJob?.status === 'succeeded') {
-    options.push({ key: 'coverage', label: t('aiJobCoverage'), id: store.coverageJob.id })
-  }
-  if (store.environmentJob?.status === 'succeeded') {
-    options.push({ key: 'environment', label: t('aiJobEnvironment'), id: store.environmentJob.id })
-  }
+  push('access', 'aiJobAccess', store.accessJob)
+  push('coverage', 'aiJobCoverage', store.coverageJob)
+  push('environment', 'aiJobEnvironment', store.environmentJob)
+  push('link', 'aiJobLink', store.linkJob)
+  push('radar', 'aiJobRadar', store.radarJob)
+  push('constellation', 'aiJobConstellation', store.constellationAnalysisJob)
+  push('interference', 'aiJobInterference', store.interferenceJob)
+  push('report', 'aiJobReport', store.reportJob)
   return options
 })
 
@@ -139,6 +159,88 @@ async function onRecommend() {
   }
 }
 
+async function onApplySuggestion() {
+  if (!store.current || !suggestion.value || busy.value || !canWrite.value) return
+  const orbit = suggestion.value.orbit
+  if (
+    !orbit ||
+    typeof orbit.altitude_km !== 'number' ||
+    typeof orbit.inclination_deg !== 'number'
+  ) {
+    ElMessage.warning(t('aiApplyNeedOrbit'))
+    return
+  }
+
+  const constellation = suggestion.value.constellation
+  const total = Math.min(Math.max(constellation?.total_satellites ?? 1, 1), 100)
+  const planes = Math.min(Math.max(constellation?.planes ?? 1, 1), total)
+
+  busy.value = 'apply'
+  try {
+    const report = await generateConstellation({
+      name: (suggestion.value.summary || t('aiSuggestion')).slice(0, 60),
+      constellation_type: constellation?.constellation_type ?? 'walker_delta',
+      altitude_km: orbit.altitude_km,
+      inclination_deg: orbit.inclination_deg,
+      total_satellites: total,
+      planes,
+      phasing: constellation?.phasing ?? 0,
+      color_by_plane: true
+    })
+    const added = await store.addConstellation(report)
+    const sensor = suggestion.value.sensor
+    const satelliteId = report.satellites[0]?.id
+    if (added > 0 && sensor && satelliteId && store.current) {
+      const half = sensor.half_angle_deg ?? 30
+      const next = {
+        ...store.current.data,
+        sensors: [
+          ...store.current.data.sensors,
+          {
+            id: crypto.randomUUID(),
+            name: `${t('aiSuggestion')}-${satelliteId.slice(0, 4)}`,
+            enabled: true,
+            color: '#4fc3f7',
+            satellite_id: satelliteId,
+            shape: sensor.shape ?? 'conical',
+            half_angle_deg: half,
+            horizontal_fov_deg: half * 2,
+            vertical_fov_deg: half * 2,
+            pointing_mode: sensor.pointing_mode ?? 'nadir',
+            fixed_azimuth_deg: 0,
+            fixed_off_nadir_deg: 0,
+            max_range_km: sensor.max_range_km ?? 3000
+          }
+        ]
+      }
+      await store.saveData(next)
+    }
+    ElMessage.success(t('aiApplyDone'))
+  } catch (error) {
+    ElMessage.error(`${t('aiApplyFailed')}: ${errorText(error)}`)
+  } finally {
+    busy.value = null
+  }
+}
+
+async function onSaveInterpretation() {
+  const job = selectedJob.value
+  if (!output.value || !job || busy.value || !canWrite.value) return
+  busy.value = 'save'
+  try {
+    await saveInterpretation({
+      job_id: job.id,
+      content: output.value.content,
+      model: output.value.model
+    })
+    ElMessage.success(t('aiSaved'))
+  } catch (error) {
+    ElMessage.error(`${t('aiSaveFailed')}: ${errorText(error)}`)
+  } finally {
+    busy.value = null
+  }
+}
+
 function downloadMarkdown() {
   if (!output.value) return
   const blob = new Blob([output.value.content], { type: 'text/markdown;charset=utf-8' })
@@ -169,6 +271,7 @@ function errorText(error: unknown) {
     </el-tag>
   </div>
   <div v-if="!enabled && !configLoading" class="hint">{{ t('aiDisabledHint') }}</div>
+  <div v-else-if="enabled && !canWrite" class="hint">{{ t('aiViewerHint') }}</div>
 
   <div class="section-title">{{ t('aiPresets') }}</div>
   <div class="presets">
@@ -195,7 +298,7 @@ function errorText(error: unknown) {
       size="small"
       type="primary"
       :icon="MagicStick"
-      :disabled="!enabled || !selectedJob"
+      :disabled="!enabled || !selectedJob || !canWrite"
       :loading="busy === 'interpret'"
       @click="onInterpret"
     >
@@ -203,7 +306,7 @@ function errorText(error: unknown) {
     </el-button>
     <el-button
       size="small"
-      :disabled="!enabled || !selectedJob"
+      :disabled="!enabled || !selectedJob || !canWrite"
       :loading="busy === 'report'"
       @click="onReport"
     >
@@ -224,7 +327,7 @@ function errorText(error: unknown) {
     size="small"
     class="full"
     :icon="MagicStick"
-    :disabled="!enabled || !store.current"
+    :disabled="!enabled || !store.current || !canWrite"
     :loading="busy === 'recommend'"
     @click="onRecommend"
   >
@@ -238,7 +341,31 @@ function errorText(error: unknown) {
       <span>{{ t('aiLatency') }}: {{ output.latency_ms }} ms</span>
     </div>
     <pre class="output">{{ output.content }}</pre>
+    <template v-if="suggestion">
+      <div class="section-title">{{ t('aiSuggestion') }}</div>
+      <pre class="output">{{ JSON.stringify(suggestion, null, 2) }}</pre>
+      <el-button
+        size="small"
+        type="success"
+        class="full"
+        :loading="busy === 'apply'"
+        :disabled="!canWrite || !store.current"
+        @click="onApplySuggestion"
+      >
+        {{ t('aiApplySuggestion') }}
+      </el-button>
+    </template>
     <div class="disclaimer">{{ t('aiDisclaimer') }}</div>
+    <el-button
+      v-if="lastAction === 'interpret'"
+      size="small"
+      class="full"
+      :loading="busy === 'save'"
+      :disabled="!canWrite"
+      @click="onSaveInterpretation"
+    >
+      {{ t('aiSaveInterpretation') }}
+    </el-button>
     <el-button size="small" :icon="Download" class="full" @click="downloadMarkdown">
       {{ t('aiDownloadMd') }}
     </el-button>

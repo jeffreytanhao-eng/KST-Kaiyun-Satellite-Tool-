@@ -1,6 +1,6 @@
 import { getToken, request } from './http'
 
-export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 export type JobKind =
   | 'propagation'
   | 'access'
@@ -13,17 +13,25 @@ export type JobKind =
   | 'report'
   | 'interference'
 
-export interface Job<T = unknown> {
+/** 任务列表项：后端不返回 params/result 等大字段。 */
+export interface JobSummary {
   id: string
   scenario_id: string
   kind: JobKind
   status: JobStatus
-  params: Record<string, unknown>
-  result: T | null
   error: string | null
   created_at: string
   started_at: string | null
   finished_at: string | null
+  progress: number
+  cached: boolean
+  cancel_requested: boolean
+}
+
+export interface Job<T = unknown> extends JobSummary {
+  params: Record<string, unknown>
+  result: T | null
+  cache_key: string | null
 }
 
 export interface TrackSample {
@@ -522,6 +530,27 @@ export function getJob(id: string) {
   return request<Job>(`/jobs/${id}`)
 }
 
+export interface JobListQuery {
+  scenario_id?: string
+  status?: JobStatus
+  limit?: number
+}
+
+/** 任务列表（后端按场景可见性过滤）。 */
+export function listJobs(query: JobListQuery = {}) {
+  const params = new URLSearchParams()
+  if (query.scenario_id) params.set('scenario_id', query.scenario_id)
+  if (query.status) params.set('status', query.status)
+  if (query.limit) params.set('limit', String(query.limit))
+  const suffix = params.toString()
+  return request<JobSummary[]>(`/jobs${suffix ? `?${suffix}` : ''}`)
+}
+
+/** 取消排队中或运行中的任务（仅创建者或管理员）。 */
+export function cancelJob(id: string) {
+  return request<Job>(`/jobs/${id}/cancel`, { method: 'POST' })
+}
+
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 
 /** 轮询任务直到终态，超时抛出异常。 */
@@ -529,7 +558,7 @@ export async function waitForJob(id: string, timeoutMs = 180_000): Promise<Job> 
   const deadline = Date.now() + timeoutMs
   for (;;) {
     const job = await getJob(id)
-    if (job.status === 'succeeded' || job.status === 'failed') {
+    if (job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled') {
       return job
     }
     if (Date.now() > deadline) {

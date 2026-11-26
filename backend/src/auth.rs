@@ -29,8 +29,14 @@ pub struct Claims {
     pub sub: Uuid,
     pub username: String,
     pub org_id: Option<Uuid>,
+    #[serde(default = "default_role")]
+    pub role: String,
     pub iat: i64,
     pub exp: i64,
+}
+
+fn default_role() -> String {
+    "analyst".to_string()
 }
 
 /// 通过 Bearer Token 解析出的当前用户。
@@ -38,6 +44,34 @@ pub struct Claims {
 pub struct AuthUser {
     pub id: Uuid,
     pub org_id: Option<Uuid>,
+    pub role: String,
+}
+
+impl AuthUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
+
+    pub fn is_viewer(&self) -> bool {
+        self.role == "viewer"
+    }
+
+    /// 只读角色不能创建计算任务、AI 生成或修改场景。
+    pub fn require_writer(&self) -> Result<(), AppError> {
+        if self.is_viewer() {
+            Err(AppError::Forbidden("当前角色为只读，无写入权限"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn require_admin(&self) -> Result<(), AppError> {
+        if self.is_admin() {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden("需要组织管理员权限"))
+        }
+    }
 }
 
 impl AuthService {
@@ -53,6 +87,7 @@ impl AuthService {
         user_id: Uuid,
         username: &str,
         org_id: Option<Uuid>,
+        role: &str,
     ) -> Result<(String, DateTime<Utc>), AppError> {
         let now = Utc::now();
         let expires_at = now + chrono::Duration::from_std(self.ttl).unwrap_or_default();
@@ -60,6 +95,7 @@ impl AuthService {
             sub: user_id,
             username: username.to_string(),
             org_id,
+            role: role.to_string(),
             iat: now.timestamp(),
             exp: expires_at.timestamp(),
         };
@@ -128,9 +164,17 @@ impl FromRequestParts<AppState> for AuthUser {
             .ok_or(AppError::Unauthorized("认证格式错误"))?;
 
         let claims = state.auth.verify(token)?;
+        // 角色与组织以数据库为准，确保管理员修改角色后立即生效。
+        let row: Option<(Option<Uuid>, String)> =
+            sqlx::query_as("SELECT org_id, role FROM users WHERE id = $1")
+                .bind(claims.sub)
+                .fetch_optional(&state.pool)
+                .await?;
+        let (org_id, role) = row.ok_or(AppError::Unauthorized("用户不存在，请重新登录"))?;
         Ok(AuthUser {
             id: claims.sub,
-            org_id: claims.org_id,
+            org_id,
+            role,
         })
     }
 }
@@ -153,6 +197,7 @@ struct UserView {
     username: String,
     email: Option<String>,
     org_id: Option<Uuid>,
+    role: String,
 }
 
 #[derive(Serialize)]
@@ -168,6 +213,7 @@ struct UserRow {
     username: String,
     email: Option<String>,
     org_id: Option<Uuid>,
+    role: String,
     password_hash: String,
 }
 
@@ -176,7 +222,7 @@ async fn login(
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AppError> {
     let user: Option<UserRow> = sqlx::query_as(
-        "SELECT id, username, email, org_id, password_hash FROM users WHERE username = $1",
+        "SELECT id, username, email, org_id, role, password_hash FROM users WHERE username = $1",
     )
     .bind(&payload.username)
     .fetch_optional(&state.pool)
@@ -204,7 +250,9 @@ async fn login(
         return Err(AppError::Unauthorized("用户名或密码错误"));
     }
 
-    let (token, expires_at) = state.auth.issue(user.id, &user.username, user.org_id)?;
+    let (token, expires_at) = state
+        .auth
+        .issue(user.id, &user.username, user.org_id, &user.role)?;
 
     Ok(Json(LoginResponse {
         token,
@@ -214,13 +262,14 @@ async fn login(
             username: user.username,
             email: user.email,
             org_id: user.org_id,
+            role: user.role,
         },
     }))
 }
 
 async fn me(State(state): State<AppState>, auth: AuthUser) -> Result<Json<UserView>, AppError> {
     let user: Option<UserView> =
-        sqlx::query_as("SELECT id, username, email, org_id FROM users WHERE id = $1")
+        sqlx::query_as("SELECT id, username, email, org_id, role FROM users WHERE id = $1")
             .bind(auth.id)
             .fetch_optional(&state.pool)
             .await?;

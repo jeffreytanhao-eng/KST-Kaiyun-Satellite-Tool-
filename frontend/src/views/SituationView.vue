@@ -15,9 +15,12 @@ import {
 } from '@element-plus/icons-vue'
 
 import AiPanel from '@/components/AiPanel.vue'
+import CollabPanel from '@/components/CollabPanel.vue'
 import ConstellationPanel from '@/components/ConstellationPanel.vue'
 import CoveragePanel from '@/components/CoveragePanel.vue'
 import EnvironmentPanel from '@/components/EnvironmentPanel.vue'
+import OrgPanel from '@/components/OrgPanel.vue'
+import TaskPanel from '@/components/TaskPanel.vue'
 import LangSwitch from '@/components/LangSwitch.vue'
 import LinkPanel from '@/components/LinkPanel.vue'
 import ObjectTree from '@/components/ObjectTree.vue'
@@ -79,6 +82,9 @@ const activeTab = ref<
   | 'report'
   | 'environment'
   | 'ai'
+  | 'tasks'
+  | 'collab'
+  | 'org'
 >('props')
 const importInput = ref<HTMLInputElement | null>(null)
 
@@ -1829,6 +1835,18 @@ function formatDuration(seconds: number) {
           <el-tab-pane :label="t('tabAi')" name="ai">
             <AiPanel :active="activeTab === 'ai'" />
           </el-tab-pane>
+
+          <el-tab-pane :label="t('tabTasks')" name="tasks">
+            <TaskPanel :active="activeTab === 'tasks'" />
+          </el-tab-pane>
+
+          <el-tab-pane :label="t('tabCollab')" name="collab">
+            <CollabPanel :active="activeTab === 'collab'" />
+          </el-tab-pane>
+
+          <el-tab-pane :label="t('tabOrg')" name="org">
+            <OrgPanel :active="activeTab === 'org'" />
+          </el-tab-pane>
         </el-tabs>
       </aside>
     </main>
@@ -2268,7 +2286,7 @@ function formatDuration(seconds: number) {
 .viewport-tip {
   position: absolute;
   left: 12px;
-  bottom: 12px;
+  bottom: 76px;
   padding: 4px 8px;
   border: 1px solid var(--kst-border);
   border-radius: 4px;
@@ -2291,7 +2309,7 @@ function formatDuration(seconds: number) {
   left: 50%;
   bottom: 14px;
   transform: translateX(-50%);
-  width: min(820px, calc(100% - 48px));
+  width: min(760px, calc(100% - 64px));
   display: flex;
   align-items: center;
   gap: 10px;
