@@ -15,12 +15,16 @@ import {
 } from '@element-plus/icons-vue'
 
 import AiPanel from '@/components/AiPanel.vue'
+import ConstellationPanel from '@/components/ConstellationPanel.vue'
 import CoveragePanel from '@/components/CoveragePanel.vue'
 import EnvironmentPanel from '@/components/EnvironmentPanel.vue'
 import LangSwitch from '@/components/LangSwitch.vue'
 import LinkPanel from '@/components/LinkPanel.vue'
 import ObjectTree from '@/components/ObjectTree.vue'
 import PropagationPanel from '@/components/PropagationPanel.vue'
+import RadarPanel from '@/components/RadarPanel.vue'
+import ReportPanel from '@/components/ReportPanel.vue'
+import logoUrl from '@/assets/openspace-logo.png'
 import { useCesiumViewer } from '@/composables/useCesiumViewer'
 import { useAuthStore } from '@/stores/auth'
 import { useScenarioStore } from '@/stores/scenario'
@@ -37,7 +41,12 @@ import {
   type SensorShape,
   type SpaceTrackTle
 } from '@/api/scenarios'
-import { downloadJobCsv, type CoverageReport, type LinkBudgetReport } from '@/api/jobs'
+import {
+  downloadJobCsv,
+  type CoverageReport,
+  type LinkBudgetReport,
+  type RadarReport
+} from '@/api/jobs'
 
 type ObjectType = 'satellite' | 'station' | 'sensor'
 interface Selection {
@@ -60,7 +69,16 @@ const accessJob = computed(() => store.accessJob)
 
 const selection = ref<Selection | null>(null)
 const activeTab = ref<
-  'props' | 'access' | 'coverage' | 'propagation' | 'link' | 'environment' | 'ai'
+  | 'props'
+  | 'access'
+  | 'coverage'
+  | 'propagation'
+  | 'link'
+  | 'constellation'
+  | 'radar'
+  | 'report'
+  | 'environment'
+  | 'ai'
 >('props')
 const importInput = ref<HTMLInputElement | null>(null)
 
@@ -772,6 +790,18 @@ function linkTimeOffset(report: LinkBudgetReport | null) {
   )
 }
 
+function onShowRadar(report: RadarReport | null) {
+  cesium.showRadar(report, report ? radarTimeOffset(report) : 0)
+}
+
+/** 雷达结果与传播结果的起始时刻之差（秒）。 */
+function radarTimeOffset(report: RadarReport | null) {
+  if (!report || !playback.value) return 0
+  return (
+    (new Date(report.start).getTime() - new Date(playback.value.start).getTime()) / 1000
+  )
+}
+
 /** Access 结果与传播结果的起始时刻之差（秒）。 */
 function accessTimeOffset(report: typeof accessReport.value) {
   if (!report || !playback.value) return 0
@@ -957,7 +987,11 @@ watch(
       lastScenarioId = ''
       selection.value = null
       cesium.clearCoverage()
-      cesium.renderScenario({ satellites: [], ground_stations: [], sensors: [] }, null)
+      cesium.clearRadar()
+      cesium.renderScenario(
+        { satellites: [], ground_stations: [], sensors: [], constellations: [] },
+        null
+      )
       return
     }
 
@@ -966,6 +1000,7 @@ watch(
       lastScenarioId = current.id
       selection.value = null
       cesium.clearCoverage()
+      cesium.clearRadar()
       syncAccessDefaults()
     }
 
@@ -1032,8 +1067,10 @@ function formatDuration(seconds: number) {
 <template>
   <div class="shell">
     <header class="header">
-      <span class="product">{{ t('appTitle') }}</span>
-      <el-tag size="small" effect="dark" type="info" class="phase">{{ t('phaseLabel') }}</el-tag>
+      <div class="brand">
+        <img class="brand-logo" :src="logoUrl" alt="Openspace" />
+        <span class="product">{{ t('appSubtitle') }}</span>
+      </div>
       <span v-if="store.propagationBusy" class="busy">{{ t('propagating') }}</span>
       <span class="spacer" />
       <LangSwitch />
@@ -1716,6 +1753,18 @@ function formatDuration(seconds: number) {
             <LinkPanel />
           </el-tab-pane>
 
+          <el-tab-pane :label="t('tabConstellation')" name="constellation">
+            <ConstellationPanel @show-coverage="onShowCoverage" />
+          </el-tab-pane>
+
+          <el-tab-pane :label="t('tabRadar')" name="radar">
+            <RadarPanel @show-radar="onShowRadar" />
+          </el-tab-pane>
+
+          <el-tab-pane :label="t('tabReport')" name="report">
+            <ReportPanel />
+          </el-tab-pane>
+
           <el-tab-pane :label="t('tabEnvironment')" name="environment">
             <EnvironmentPanel />
           </el-tab-pane>
@@ -2046,22 +2095,34 @@ function formatDuration(seconds: number) {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 0 16px;
-  height: 48px;
+  padding: 0 16px 0 14px;
+  height: 56px;
   flex: none;
   background: var(--kst-panel);
   border-bottom: 1px solid var(--kst-border);
 }
 
-.product {
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 
-.phase {
-  border-color: var(--kst-border);
+.brand-logo {
+  width: 39px;
+  height: 39px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  opacity: 0.92;
+}
+
+.product {
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  line-height: 1.15;
+  white-space: nowrap;
 }
 
 .busy {
@@ -2233,9 +2294,41 @@ function formatDuration(seconds: number) {
     background-color: var(--kst-border);
   }
 
+  // 标签较多时改为两行换行排列，避免“报告”等标签被横向滚动裁切。
+  :deep(.el-tabs__nav-scroll) {
+    overflow: visible;
+    padding: 0 !important;
+  }
+
+  :deep(.el-tabs__nav) {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+    white-space: normal;
+    transform: none !important;
+    gap: 2px;
+  }
+
+  :deep(.el-tabs__nav-prev),
+  :deep(.el-tabs__nav-next) {
+    display: none;
+  }
+
+  :deep(.el-tabs__active-bar) {
+    display: none;
+  }
+
   :deep(.el-tabs__item) {
-    font-size: 12px;
-    padding: 0 8px;
+    height: 26px;
+    line-height: 26px;
+    font-size: 11px;
+    padding: 0 7px;
+  }
+
+  :deep(.el-tabs__item.is-active) {
+    color: var(--kst-accent-strong);
+    background: rgba(79, 195, 247, 0.12);
+    border-radius: 4px;
   }
 }
 

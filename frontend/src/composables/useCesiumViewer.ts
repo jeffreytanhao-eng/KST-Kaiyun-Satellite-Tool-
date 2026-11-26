@@ -12,6 +12,7 @@ import type {
   LinkWindow,
   PropagationCompareReport,
   PropagationReport,
+  RadarReport,
   SatelliteTrack,
   SensorSample,
   SensorTrack,
@@ -65,6 +66,10 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
   let linkBudgetEntities: Cesium.Entity[] = []
   let linkBudgetLine: Cesium.Entity | null = null
   let comparisonEntities: Cesium.Entity[] = []
+  let radarReport: RadarReport | null = null
+  let radarTimeOffset = 0
+  let radarEntities: Cesium.Entity[] = []
+  let radarLine: Cesium.Entity | null = null
   async function init() {
     if (!host.value) return
 
@@ -147,6 +152,9 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     linkBudgetEntities = []
     linkBudgetLine = null
     comparisonEntities = []
+    radarReport = null
+    radarEntities = []
+    radarLine = null
   }
 
   function renderScenario(data: ScenarioData, report: PropagationReport | null) {
@@ -372,6 +380,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     updateAttitude(tSeconds)
     updateAccessLink()
     updateLinkBudget()
+    updateRadar()
   }
 
   /** 更新卫星本体坐标轴（长度约 120 km，按实时姿态方向）。 */
@@ -793,6 +802,144 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     linkBudgetReport = null
   }
 
+  /** 显示雷达探测范围与可探测弧段（绿色），并在窗口内绘制实时波束连线。 */
+  function showRadar(report: RadarReport | null, timeOffsetSeconds = 0) {
+    const instance = viewer.value
+    if (!instance) return
+    clearRadar()
+    radarReport = report
+    radarTimeOffset = timeOffsetSeconds
+    if (!report) return
+
+    const station = stations.get(report.ground_station_id)
+    if (station) {
+      const range = Math.max(report.max_detection_range_km * 1000, 1000)
+      radarEntities.push(
+        instance.entities.add({
+          id: 'radar-coverage',
+          position: Cesium.Cartesian3.fromDegrees(
+            station.longitude,
+            station.latitude,
+            station.altitudeKm * 1000
+          ),
+          ellipsoid: {
+            radii: new Cesium.Cartesian3(range, range, range),
+            material: Cesium.Color.fromCssColorString('#66bb6a').withAlpha(0.12),
+            outline: true,
+            outlineColor: Cesium.Color.fromCssColorString('#66bb6a').withAlpha(0.55)
+          }
+        })
+      )
+    }
+
+    const visual = satellites.get(report.satellite_id)
+    if (visual?.track) {
+      const color = Cesium.Color.fromCssColorString('#66bb6a')
+      for (const window of report.windows) {
+        if (window.max_snr_db < report.required_snr_db) continue
+        const start = window.start_seconds + timeOffsetSeconds
+        const end = window.end_seconds + timeOffsetSeconds
+        const points = visual.track.samples.filter(
+          (sample) => sample.t_seconds >= start && sample.t_seconds <= end
+        )
+        if (points.length < 2) continue
+        radarEntities.push(
+          instance.entities.add({
+            id: `radar-arc-${window.index}`,
+            polyline: {
+              positions: Cesium.Cartesian3.fromDegreesArrayHeights(
+                points.flatMap((sample) => [
+                  sample.longitude_deg,
+                  sample.latitude_deg,
+                  sample.altitude_km * 1000
+                ])
+              ),
+              width: 5,
+              arcType: Cesium.ArcType.NONE,
+              material: new Cesium.PolylineGlowMaterialProperty({
+                glowPower: 0.3,
+                color: color.withAlpha(0.95)
+              })
+            }
+          })
+        )
+      }
+    }
+
+    if (station) {
+      radarLine = instance.entities.add({
+        id: 'radar-live',
+        show: false,
+        polyline: {
+          positions: [] as Cesium.Cartesian3[],
+          width: 2,
+          arcType: Cesium.ArcType.NONE,
+          material: new Cesium.PolylineDashMaterialProperty({
+            color: Cesium.Color.fromCssColorString('#66bb6a').withAlpha(0.9),
+            dashLength: 10
+          })
+        }
+      })
+      updateRadar()
+    }
+  }
+
+  function updateRadar() {
+    if (!radarLine || !radarReport) return
+    const visual = satellites.get(radarReport.satellite_id)
+    const station = stations.get(radarReport.ground_station_id)
+    if (!visual?.track || !station) {
+      radarLine.show = false
+      return
+    }
+    const shifted = radarReport.windows
+      .map((window) => ({
+        window,
+        start: window.start_seconds + radarTimeOffset,
+        end: window.end_seconds + radarTimeOffset
+      }))
+      .find((entry) => playhead >= entry.start && playhead <= entry.end)
+    const satelliteSample = sampleAt(visual.track.samples, playhead)
+    if (!shifted || !satelliteSample) {
+      radarLine.show = false
+      return
+    }
+    const localTime = playhead - radarTimeOffset
+    const sample = nearestRadarSample(shifted.window.samples, localTime)
+    const detected = Boolean(sample?.detected)
+    if (radarLine.polyline) {
+      radarLine.polyline.positions = new Cesium.ConstantProperty([
+        Cesium.Cartesian3.fromDegrees(
+          station.longitude,
+          station.latitude,
+          station.altitudeKm * 1000
+        ),
+        Cesium.Cartesian3.fromDegrees(
+          satelliteSample.longitude_deg,
+          satelliteSample.latitude_deg,
+          satelliteSample.altitude_km * 1000
+        )
+      ])
+      radarLine.polyline.material = new Cesium.PolylineDashMaterialProperty({
+        color: Cesium.Color.fromCssColorString(detected ? '#66bb6a' : '#ef5350').withAlpha(0.95),
+        dashLength: 10
+      })
+      radarLine.show = true
+    }
+  }
+
+  function clearRadar() {
+    const instance = viewer.value
+    if (!instance) return
+    for (const entity of radarEntities) instance.entities.remove(entity)
+    radarEntities = []
+    if (radarLine) {
+      instance.entities.remove(radarLine)
+      radarLine = null
+    }
+    radarReport = null
+  }
+
   /** 显示 SGP4 与数值积分对比轨迹（实线 vs 虚线），并隐藏原始轨道线避免重叠。 */
   function showComparison(report: PropagationCompareReport | null) {
     const instance = viewer.value
@@ -915,6 +1062,8 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     clearCoverage,
     showLinkBudget,
     clearLinkBudget,
+    showRadar,
+    clearRadar,
     showComparison,
     clearComparison,
     flyToScenario,
@@ -1047,6 +1196,21 @@ function linkSampleAt(window: LinkWindow, tSeconds: number) {
     margin_db: a.margin_db + (b.margin_db - a.margin_db) * fraction,
     elevation_deg: a.elevation_deg + (b.elevation_deg - a.elevation_deg) * fraction
   }
+}
+
+/** 在雷达采样序列中查找时间最接近的样本。 */
+function nearestRadarSample(samples: RadarReport['samples'], tSeconds: number) {
+  if (samples.length === 0) return null
+  let nearest = samples[0]
+  let best = Math.abs(nearest.t_seconds - tSeconds)
+  for (const sample of samples) {
+    const distance = Math.abs(sample.t_seconds - tSeconds)
+    if (distance < best) {
+      best = distance
+      nearest = sample
+    }
+  }
+  return nearest
 }
 
 function normalizeVector(

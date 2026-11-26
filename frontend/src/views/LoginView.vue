@@ -46,7 +46,7 @@ async function onSubmit() {
     </div>
 
     <div class="brand">
-      <h1>KST</h1>
+      <h1>OSKT</h1>
       <p>{{ t('brandSubtitle') }}</p>
     </div>
     <el-card class="login-card" shadow="always">

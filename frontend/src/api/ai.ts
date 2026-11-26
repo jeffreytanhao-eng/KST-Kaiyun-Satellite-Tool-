@@ -45,3 +45,11 @@ export function generateJobReport(jobId: string, locale: string) {
     body: JSON.stringify({ job_id: jobId, locale })
   })
 }
+
+/** 使用 AI 润色 Markdown 报告（保持数值不变）。 */
+export function polishReport(markdown: string, locale: string) {
+  return request<AiResponse>('/ai/polish', {
+    method: 'POST',
+    body: JSON.stringify({ markdown, locale })
+  })
+}

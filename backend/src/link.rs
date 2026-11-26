@@ -35,6 +35,34 @@ pub struct LinkOptions {
     pub bandwidth_hz: f64,
     /// 所需 C/N0（dB-Hz），用于计算链路余量。
     pub required_cn0_dbhz: f64,
+    /// 卫星发射天线方向图：`omni`（全向）或 `cosine`（余弦型）。
+    #[serde(default = "default_antenna_pattern")]
+    pub satellite_antenna_pattern: String,
+    /// 余弦方向图指数，越大主瓣越窄。
+    #[serde(default = "default_pattern_exponent")]
+    pub satellite_pattern_exponent: f64,
+    /// 大气衰减模型：`none`、`simple` 或 `itu`。
+    #[serde(default = "default_atmosphere_model")]
+    pub atmosphere_model: String,
+    /// 天顶大气衰减（dB），`itu` 模式下为 0 时按频率查表。
+    #[serde(default = "default_zenith_attenuation")]
+    pub zenith_attenuation_db: f64,
+}
+
+fn default_antenna_pattern() -> String {
+    "omni".to_string()
+}
+
+fn default_pattern_exponent() -> f64 {
+    2.0
+}
+
+fn default_atmosphere_model() -> String {
+    "simple".to_string()
+}
+
+fn default_zenith_attenuation() -> f64 {
+    0.05
 }
 
 impl Default for LinkOptions {
@@ -48,6 +76,10 @@ impl Default for LinkOptions {
             system_noise_temp_k: 500.0,
             bandwidth_hz: 1.0e6,
             required_cn0_dbhz: 60.0,
+            satellite_antenna_pattern: "omni".to_string(),
+            satellite_pattern_exponent: 2.0,
+            atmosphere_model: "simple".to_string(),
+            zenith_attenuation_db: 0.05,
         }
     }
 }
@@ -75,7 +107,87 @@ impl LinkOptions {
         if !self.bandwidth_hz.is_finite() || !(1.0..=1.0e12).contains(&self.bandwidth_hz) {
             return Err("带宽需在 1 Hz ~ 1 THz 内".into());
         }
+        match self.satellite_antenna_pattern.as_str() {
+            "omni" | "cosine" => {}
+            other => return Err(format!("未知天线方向图：{other}")),
+        }
+        if !self.satellite_pattern_exponent.is_finite()
+            || !(0.1..=50.0).contains(&self.satellite_pattern_exponent)
+        {
+            return Err("天线方向图指数需在 [0.1, 50] 内".into());
+        }
+        match self.atmosphere_model.as_str() {
+            "none" | "simple" | "itu" => {}
+            other => return Err(format!("未知大气衰减模型：{other}")),
+        }
+        if !self.zenith_attenuation_db.is_finite()
+            || !(0.0..=100.0).contains(&self.zenith_attenuation_db)
+        {
+            return Err("天顶大气衰减需在 [0, 100] dB 内".into());
+        }
         Ok(())
+    }
+}
+
+/// 余弦型天线方向图相对峰值增益（dB）。
+fn antenna_pattern_gain_db(pattern: &str, exponent: f64, off_nadir_deg: f64) -> f64 {
+    match pattern {
+        "cosine" => {
+            let angle = off_nadir_deg.clamp(0.0, 89.9).to_radians();
+            (10.0 * exponent * angle.cos().log10()).clamp(-60.0, 0.0)
+        }
+        _ => 0.0,
+    }
+}
+
+/// 天顶大气衰减查表（简化 ITU-R P.676 量级）。
+fn itu_zenith_attenuation_db(frequency_hz: f64) -> f64 {
+    let ghz = frequency_hz / 1e9;
+    const TABLE: [(f64, f64); 9] = [
+        (1.0, 0.02),
+        (2.0, 0.04),
+        (6.0, 0.06),
+        (10.0, 0.12),
+        (15.0, 0.25),
+        (20.0, 0.40),
+        (30.0, 0.80),
+        (50.0, 2.00),
+        (100.0, 5.00),
+    ];
+    if ghz <= TABLE[0].0 {
+        return TABLE[0].1;
+    }
+    for pair in TABLE.windows(2) {
+        let (low_freq, low_value) = pair[0];
+        let (high_freq, high_value) = pair[1];
+        if ghz <= high_freq {
+            let ratio = (ghz - low_freq) / (high_freq - low_freq);
+            return low_value + ratio * (high_value - low_value);
+        }
+    }
+    TABLE[TABLE.len() - 1].1
+}
+
+/// 大气衰减（dB），随仰角增大而减小。
+fn atmospheric_loss_db(
+    model: &str,
+    elevation_deg: f64,
+    zenith_attenuation_db: f64,
+    frequency_hz: f64,
+) -> f64 {
+    let elevation = elevation_deg.clamp(0.1, 90.0).to_radians().sin();
+    match model {
+        "none" => 0.0,
+        "itu" => {
+            let zenith = if zenith_attenuation_db > 0.0 {
+                zenith_attenuation_db
+            } else {
+                itu_zenith_attenuation_db(frequency_hz)
+            };
+            (zenith / elevation).clamp(zenith, 30.0)
+        }
+        // 默认简化模型：天顶 0.05 dB，按 1/sin(仰角) 放大，上限 1 dB。
+        _ => (0.05 / elevation).clamp(0.05, 1.0),
     }
 }
 
@@ -85,11 +197,23 @@ pub struct LinkSample {
     pub t_seconds: f64,
     pub elevation_deg: f64,
     pub range_km: f64,
+    pub off_nadir_deg: f64,
+    pub pattern_gain_db: f64,
     pub free_space_loss_db: f64,
     pub atmospheric_loss_db: f64,
     pub received_power_dbw: f64,
     pub cn0_dbhz: f64,
     pub eb_n0_db: f64,
+    pub margin_db: f64,
+}
+
+/// 链路余量曲线点，便于前端直接绘图。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkCurvePoint {
+    pub t_seconds: f64,
+    pub elevation_deg: f64,
+    pub range_km: f64,
+    pub cn0_dbhz: f64,
     pub margin_db: f64,
 }
 
@@ -131,6 +255,12 @@ pub struct LinkBudgetReport {
     pub mean_margin_db: f64,
     pub max_range_km: f64,
     pub mean_free_space_loss_db: f64,
+    pub satellite_antenna_pattern: String,
+    pub satellite_pattern_exponent: f64,
+    pub atmosphere_model: String,
+    pub mean_atmospheric_loss_db: f64,
+    pub max_atmospheric_loss_db: f64,
+    pub curve: Vec<LinkCurvePoint>,
     pub windows: Vec<LinkWindow>,
 }
 
@@ -175,16 +305,26 @@ fn evaluate_sample(
     t_seconds: f64,
     elevation_deg: f64,
     range_km: f64,
+    off_nadir_deg: f64,
 ) -> LinkSample {
     let range_m = (range_km * 1000.0).max(1.0);
     let wavelength = SPEED_OF_LIGHT / options.frequency_hz;
     let free_space_loss_db = 20.0 * (4.0 * std::f64::consts::PI * range_m / wavelength).log10();
 
-    // 简化大气衰减：天顶约 0.05 dB，按 1/sin(仰角) 放大，上限 1 dB。
-    let elevation_rad = elevation_deg.clamp(0.1, 90.0).to_radians();
-    let atmospheric_loss_db = (0.05 / elevation_rad.sin()).clamp(0.05, 1.0);
+    let atmospheric_loss_db = atmospheric_loss_db(
+        &options.atmosphere_model,
+        elevation_deg,
+        options.zenith_attenuation_db,
+        options.frequency_hz,
+    );
+    let pattern_gain_db = antenna_pattern_gain_db(
+        &options.satellite_antenna_pattern,
+        options.satellite_pattern_exponent,
+        off_nadir_deg,
+    );
 
-    let eirp_dbw = options.tx_power_dbw + options.tx_gain_db - options.misc_loss_db;
+    let eirp_dbw =
+        options.tx_power_dbw + options.tx_gain_db + pattern_gain_db - options.misc_loss_db;
     let received_power_dbw =
         eirp_dbw + options.rx_gain_db - free_space_loss_db - atmospheric_loss_db;
     let noise_spectral_density_dbw_hz =
@@ -197,6 +337,8 @@ fn evaluate_sample(
         t_seconds,
         elevation_deg,
         range_km,
+        off_nadir_deg,
+        pattern_gain_db,
         free_space_loss_db,
         atmospheric_loss_db,
         received_power_dbw,
@@ -261,6 +403,10 @@ pub fn compute_link_budget(
     let mut max_range = 0.0_f64;
     let mut fsl_sum = 0.0_f64;
     let mut fsl_count = 0usize;
+    let mut atmosphere_sum = 0.0_f64;
+    let mut atmosphere_max = 0.0_f64;
+    let mut atmosphere_count = 0usize;
+    let mut curve = Vec::new();
 
     for window in &access.windows {
         let mut samples = Vec::new();
@@ -277,7 +423,17 @@ pub fn compute_link_budget(
                 let dz = position[2] - station_position[2];
                 (dx * dx + dy * dy + dz * dz).sqrt()
             };
-            samples.push(evaluate_sample(options, *t_seconds, elevation, range_km));
+            let off_nadir_deg = off_nadir_angle(*position, station_position);
+            let sample =
+                evaluate_sample(options, *t_seconds, elevation, range_km, off_nadir_deg);
+            curve.push(LinkCurvePoint {
+                t_seconds: sample.t_seconds,
+                elevation_deg: sample.elevation_deg,
+                range_km: sample.range_km,
+                cn0_dbhz: sample.cn0_dbhz,
+                margin_db: sample.margin_db,
+            });
+            samples.push(sample);
         }
         if samples.is_empty() {
             continue;
@@ -307,6 +463,9 @@ pub fn compute_link_budget(
             max_range = max_range.max(sample.range_km);
             fsl_sum += sample.free_space_loss_db;
             fsl_count += 1;
+            atmosphere_sum += sample.atmospheric_loss_db;
+            atmosphere_max = atmosphere_max.max(sample.atmospheric_loss_db);
+            atmosphere_count += 1;
         }
 
         let mean_margin = window_margin_sum / samples.len() as f64;
@@ -359,25 +518,62 @@ pub fn compute_link_budget(
         } else {
             0.0
         },
+        satellite_antenna_pattern: options.satellite_antenna_pattern.clone(),
+        satellite_pattern_exponent: options.satellite_pattern_exponent,
+        atmosphere_model: options.atmosphere_model.clone(),
+        mean_atmospheric_loss_db: if atmosphere_count > 0 {
+            atmosphere_sum / atmosphere_count as f64
+        } else {
+            0.0
+        },
+        max_atmospheric_loss_db: atmosphere_max,
+        curve,
         windows,
     })
+}
+
+/// 卫星到地面站方向相对星下点方向的离轴角（度）。
+fn off_nadir_angle(satellite: [f64; 3], station: [f64; 3]) -> f64 {
+    let satellite_range = (satellite[0] * satellite[0]
+        + satellite[1] * satellite[1]
+        + satellite[2] * satellite[2])
+        .sqrt();
+    let direction = [
+        station[0] - satellite[0],
+        station[1] - satellite[1],
+        station[2] - satellite[2],
+    ];
+    let direction_range = (direction[0] * direction[0]
+        + direction[1] * direction[1]
+        + direction[2] * direction[2])
+        .sqrt();
+    if satellite_range <= 0.0 || direction_range <= 0.0 {
+        return 0.0;
+    }
+    let dot = (direction[0] * -satellite[0]
+        + direction[1] * -satellite[1]
+        + direction[2] * -satellite[2])
+        / (direction_range * satellite_range);
+    dot.clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 /// 导出链路预算 CSV。
 pub fn link_csv(report: &LinkBudgetReport) -> String {
     let mut output = String::from(
-        "window,start_utc,end_utc,t_seconds,elevation_deg,range_km,fsl_db,atmosphere_db,received_power_dbw,cn0_dbhz,eb_n0_db,margin_db\n",
+        "window,start_utc,end_utc,t_seconds,elevation_deg,range_km,off_nadir_deg,pattern_gain_db,fsl_db,atmosphere_db,received_power_dbw,cn0_dbhz,eb_n0_db,margin_db\n",
     );
     for window in &report.windows {
         for sample in &window.samples {
             output.push_str(&format!(
-                "{},{},{},{:.1},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3}\n",
+                "{},{},{},{:.1},{:.4},{:.3},{:.3},{:.3},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3}\n",
                 window.index,
                 window.start_utc,
                 window.end_utc,
                 sample.t_seconds,
                 sample.elevation_deg,
                 sample.range_km,
+                sample.off_nadir_deg,
+                sample.pattern_gain_db,
                 sample.free_space_loss_db,
                 sample.atmospheric_loss_db,
                 sample.received_power_dbw,
@@ -386,6 +582,312 @@ pub fn link_csv(report: &LinkBudgetReport) -> String {
                 sample.margin_db,
             ));
         }
+    }
+    output
+}
+
+/// 同频干扰逐点样本（C/I 为载干比，dB）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterferenceSample {
+    pub t_seconds: f64,
+    pub elevation_deg: f64,
+    pub range_km: f64,
+    pub desired_cn0_dbhz: f64,
+    pub interference_cn0_dbhz: f64,
+    pub ci_db: f64,
+    pub interferer_count: u32,
+}
+
+/// 单个干扰源对目标链路的贡献统计。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfererStat {
+    pub satellite_id: String,
+    pub satellite_name: String,
+    pub min_ci_db: f64,
+    pub mean_ci_db: f64,
+    pub visible_samples: u32,
+}
+
+/// 同频干扰分析报告。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterferenceReport {
+    pub desired_satellite_id: String,
+    pub desired_satellite_name: String,
+    pub ground_station_id: String,
+    pub ground_station_name: String,
+    pub start: String,
+    pub end: String,
+    pub step_seconds: f64,
+    pub frequency_hz: f64,
+    pub threshold_ci_db: f64,
+    pub sample_count: u32,
+    pub degraded_samples: u32,
+    pub degraded_ratio: f64,
+    pub min_ci_db: f64,
+    pub mean_ci_db: f64,
+    pub interferers: Vec<InterfererStat>,
+    pub samples: Vec<InterferenceSample>,
+}
+
+/// 在时间序列中查找与 `t_seconds` 最接近的状态样本。
+fn nearest_state<'a>(
+    states: &'a [(f64, [f64; 3], [f64; 3], [f64; 3])],
+    t_seconds: f64,
+) -> Option<&'a (f64, [f64; 3], [f64; 3], [f64; 3])> {
+    if states.is_empty() {
+        return None;
+    }
+    let mut best = &states[0];
+    let mut best_delta = (best.0 - t_seconds).abs();
+    for state in states.iter().skip(1) {
+        let delta = (state.0 - t_seconds).abs();
+        if delta < best_delta {
+            best = state;
+            best_delta = delta;
+        }
+    }
+    Some(best)
+}
+
+/// 计算目标链路在干扰源同时同频工作时的载干比（C/I）。
+///
+/// 干扰功率按线性功率求和；仅当干扰源相对地面站仰角不低于站最小仰角时计入。
+pub fn compute_interference(
+    data: &ScenarioData,
+    satellite_id: &str,
+    ground_station_id: &str,
+    interferer_ids: &[String],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    step_seconds: f64,
+    options: &LinkOptions,
+    threshold_ci_db: f64,
+) -> Result<InterferenceReport, String> {
+    options.validate()?;
+    if !(1.0..=3_600.0).contains(&step_seconds) || !step_seconds.is_finite() {
+        return Err("任务步长需在 [1, 3600] 秒内".into());
+    }
+    if !threshold_ci_db.is_finite() || !(-50.0..=100.0).contains(&threshold_ci_db) {
+        return Err("C/I 门限需在 [-50, 100] dB 内".into());
+    }
+
+    let desired = data
+        .satellite(satellite_id)
+        .ok_or_else(|| format!("场景中不存在卫星 {satellite_id}"))?;
+    let station = data
+        .ground_station(ground_station_id)
+        .ok_or_else(|| format!("场景中不存在地面站 {ground_station_id}"))?;
+
+    let mut unique = Vec::new();
+    for id in interferer_ids {
+        if id.trim().is_empty() || id == satellite_id || unique.iter().any(|item| item == id) {
+            continue;
+        }
+        unique.push(id.clone());
+    }
+    if unique.is_empty() {
+        return Err("请至少选择一个与目标卫星不同的干扰源".into());
+    }
+    if unique.len() > 20 {
+        return Err("单次干扰分析最多支持 20 个干扰源".into());
+    }
+
+    let mut interferers = Vec::new();
+    let mut interferer_states = Vec::new();
+    let sample_step = (step_seconds / 2.0).clamp(1.0, 15.0);
+    for id in &unique {
+        let satellite = data
+            .satellite(id)
+            .ok_or_else(|| format!("场景中不存在干扰卫星 {id}"))?;
+        interferers.push(satellite.clone());
+        interferer_states.push(sample_states(satellite, start, end, sample_step)?);
+    }
+
+    let access_options = AccessOptions {
+        min_elevation_deg: Some(station.min_elevation_deg),
+        ..Default::default()
+    };
+    let access = compute_access(
+        data,
+        satellite_id,
+        ground_station_id,
+        start,
+        end,
+        step_seconds,
+        &access_options,
+    )?;
+    if access.windows.is_empty() {
+        return Err("目标卫星在分析时段内无可用 Access 窗口，无法进行干扰分析".into());
+    }
+
+    let desired_states = sample_states(desired, start, end, sample_step)?;
+    let station_position = station_ecef(station);
+    let latitude = station.latitude_deg.to_radians();
+    let longitude = station.longitude_deg.to_radians();
+    let (sin_lat, cos_lat) = latitude.sin_cos();
+    let (sin_lon, cos_lon) = longitude.sin_cos();
+    let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
+    let east = [-sin_lon, cos_lon, 0.0];
+    let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
+
+    let mut samples = Vec::new();
+    let mut stats: Vec<(f64, f64, u32)> = vec![(f64::INFINITY, 0.0, 0); interferers.len()];
+
+    for window in &access.windows {
+        for (t_seconds, position, _, _) in &desired_states {
+            if *t_seconds < window.start_seconds - 1e-6
+                || *t_seconds > window.end_seconds + 1e-6
+            {
+                continue;
+            }
+            let (elevation, _) = look_angles(*position, station_position, up, east, north);
+            if elevation < station.min_elevation_deg - 1e-6 {
+                continue;
+            }
+            let dx = position[0] - station_position[0];
+            let dy = position[1] - station_position[1];
+            let dz = position[2] - station_position[2];
+            let range_km = (dx * dx + dy * dy + dz * dz).sqrt();
+            let desired_sample = evaluate_sample(
+                options,
+                *t_seconds,
+                elevation,
+                range_km,
+                off_nadir_angle(*position, station_position),
+            );
+
+            let mut interference_linear = 0.0_f64;
+            let mut interferer_count = 0u32;
+            for (index, states) in interferer_states.iter().enumerate() {
+                let Some(state) = nearest_state(states, *t_seconds) else {
+                    continue;
+                };
+                if (state.0 - *t_seconds).abs() > sample_step {
+                    continue;
+                }
+                let (interferer_elevation, _) =
+                    look_angles(state.1, station_position, up, east, north);
+                if interferer_elevation < station.min_elevation_deg - 1e-6 {
+                    continue;
+                }
+                let inter_dx = state.1[0] - station_position[0];
+                let inter_dy = state.1[1] - station_position[1];
+                let inter_dz = state.1[2] - station_position[2];
+                let inter_range_km =
+                    (inter_dx * inter_dx + inter_dy * inter_dy + inter_dz * inter_dz).sqrt();
+                let inter_sample = evaluate_sample(
+                    options,
+                    state.0,
+                    interferer_elevation,
+                    inter_range_km,
+                    off_nadir_angle(state.1, station_position),
+                );
+                let linear = 10.0_f64.powf(inter_sample.cn0_dbhz / 10.0);
+                if !linear.is_finite() {
+                    continue;
+                }
+                interference_linear += linear;
+                interferer_count += 1;
+                let ci = (desired_sample.cn0_dbhz - inter_sample.cn0_dbhz).clamp(-30.0, 60.0);
+                let entry = &mut stats[index];
+                entry.0 = entry.0.min(ci);
+                entry.1 += ci;
+                entry.2 += 1;
+            }
+
+            let (interference_cn0_dbhz, ci_db) = if interference_linear > 0.0 {
+                let total = 10.0 * interference_linear.log10();
+                (
+                    total,
+                    (desired_sample.cn0_dbhz - total).clamp(-30.0, 60.0),
+                )
+            } else {
+                // 无干扰源可见时把 C/I 上限截断到 60 dB，避免无穷值。
+                (desired_sample.cn0_dbhz - 60.0, 60.0)
+            };
+
+            samples.push(InterferenceSample {
+                t_seconds: *t_seconds,
+                elevation_deg: elevation,
+                range_km,
+                desired_cn0_dbhz: desired_sample.cn0_dbhz,
+                interference_cn0_dbhz,
+                ci_db,
+                interferer_count,
+            });
+        }
+    }
+
+    if samples.is_empty() {
+        return Err("分析时段内没有可用的目标链路采样点".into());
+    }
+
+    let min_ci = samples
+        .iter()
+        .map(|sample| sample.ci_db)
+        .fold(f64::INFINITY, f64::min);
+    let mean_ci = samples.iter().map(|sample| sample.ci_db).sum::<f64>() / samples.len() as f64;
+    let degraded = samples
+        .iter()
+        .filter(|sample| sample.ci_db < threshold_ci_db)
+        .count() as u32;
+
+    let interferer_stats = interferers
+        .iter()
+        .enumerate()
+        .map(|(index, satellite)| {
+            let (min_ci, sum, count) = stats[index];
+            InterfererStat {
+                satellite_id: satellite.id.clone(),
+                satellite_name: satellite.name.clone(),
+                min_ci_db: if min_ci.is_finite() { min_ci } else { 60.0 },
+                mean_ci_db: if count > 0 { sum / count as f64 } else { 60.0 },
+                visible_samples: count,
+            }
+        })
+        .collect();
+
+    Ok(InterferenceReport {
+        desired_satellite_id: desired.id.clone(),
+        desired_satellite_name: desired.name.clone(),
+        ground_station_id: station.id.clone(),
+        ground_station_name: station.name.clone(),
+        start: format_utc(start),
+        end: format_utc(end),
+        step_seconds,
+        frequency_hz: options.frequency_hz,
+        threshold_ci_db,
+        sample_count: samples.len() as u32,
+        degraded_samples: degraded,
+        degraded_ratio: degraded as f64 / samples.len() as f64,
+        min_ci_db: min_ci,
+        mean_ci_db: mean_ci,
+        interferers: interferer_stats,
+        samples,
+    })
+}
+
+/// 导出同频干扰分析 CSV。
+pub fn interference_csv(report: &InterferenceReport) -> String {
+    let mut output = String::from(
+        "t_seconds,elevation_deg,range_km,desired_cn0_dbhz,interference_cn0_dbhz,ci_db,interferer_count,degraded\n",
+    );
+    for sample in &report.samples {
+        output.push_str(&format!(
+            "{:.1},{:.4},{:.3},{:.3},{:.3},{:.3},{},{}\n",
+            sample.t_seconds,
+            sample.elevation_deg,
+            sample.range_km,
+            sample.desired_cn0_dbhz,
+            sample.interference_cn0_dbhz,
+            sample.ci_db,
+            sample.interferer_count,
+            if sample.ci_db < report.threshold_ci_db {
+                1
+            } else {
+                0
+            }
+        ));
     }
     output
 }

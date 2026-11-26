@@ -27,6 +27,7 @@ pub fn router() -> Router<AppState> {
         .route("/interpret", post(interpret))
         .route("/recommend", post(recommend))
         .route("/report", post(report))
+        .route("/polish", post(polish))
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +63,13 @@ struct RecommendRequest {
 #[derive(Debug, Deserialize)]
 struct ReportRequest {
     job_id: Uuid,
+    #[serde(default)]
+    locale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolishRequest {
+    markdown: String,
     #[serde(default)]
     locale: Option<String>,
 }
@@ -519,6 +527,60 @@ async fn report(
         "{}\n\n请基于以下后端计算结果撰写报告，包含：任务概述、方法与约束、关键结果、风险与建议、结论。结尾注明“本报告由 AI 生成，需人工复核”。\n\n```json\n{}\n```",
         language_instruction(payload.locale.as_deref()),
         serde_json::to_string_pretty(&summary.summary).unwrap_or_default()
+    );
+
+    match state.ai.complete(system, &user_prompt).await {
+        Ok((content, latency_ms)) => {
+            record_finish(&state, request_id, None, Some(latency_ms)).await;
+            Ok(Json(AiResponse {
+                content,
+                model: state.ai.model().to_string(),
+                latency_ms,
+                request_id: request_id.unwrap_or_else(Uuid::nil),
+            }))
+        }
+        Err(error) => {
+            record_finish(&state, request_id, Some(&error), None).await;
+            Err(AppError::BadRequest(error))
+        }
+    }
+}
+
+async fn polish(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(payload): Json<PolishRequest>,
+) -> Result<Json<AiResponse>, AppError> {
+    ensure_enabled(&state)?;
+    let markdown = payload.markdown.trim();
+    if markdown.is_empty() {
+        return Err(AppError::BadRequest("待润色的报告内容为空".into()));
+    }
+    if markdown.chars().count() > 30_000 {
+        return Err(AppError::BadRequest("报告内容过长，无法进行 AI 润色".into()));
+    }
+
+    let request_id = record_start(
+        &state,
+        &user,
+        "report_polish",
+        "report_polish",
+        None,
+        None,
+        state.ai.model(),
+    )
+    .await;
+
+    let english = language_instruction(payload.locale.as_deref()).starts_with("Please");
+    let system = if english {
+        "You are a senior space mission analyst. Polish the provided Markdown report: improve structure, clarity and professionalism, but never invent or alter numeric results."
+    } else {
+        "你是一位资深航天任务分析专家。请在完全不改动任何数值结果的前提下润色给定 Markdown 报告，提升结构、可读性与专业表达；不要编造数据，不要删除表格。"
+    };
+    let user_prompt = format!(
+        "{}\n\n请直接输出润色后的完整 Markdown 报告，不要添加解释性前言。\n\n```markdown\n{}\n```",
+        language_instruction(payload.locale.as_deref()),
+        markdown
     );
 
     match state.ai.complete(system, &user_prompt).await {

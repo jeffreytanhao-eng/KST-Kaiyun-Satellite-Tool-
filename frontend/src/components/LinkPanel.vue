@@ -3,7 +3,12 @@ import { computed, reactive, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Download } from '@element-plus/icons-vue'
 
-import { downloadJobCsv, type LinkOptions } from '@/api/jobs'
+import {
+  downloadJobCsv,
+  type AntennaPattern,
+  type AtmosphereModel,
+  type LinkOptions
+} from '@/api/jobs'
 import { useScenarioStore } from '@/stores/scenario'
 import { useI18n } from '@/i18n'
 
@@ -23,11 +28,44 @@ const form = reactive({
   miscLossDb: 1,
   noiseTempK: 500,
   bandwidthKhz: 1000,
-  requiredCn0Dbm: 60
+  requiredCn0Dbm: 60,
+  pattern: 'omni' as AntennaPattern,
+  patternExponent: 2,
+  atmosphere: 'simple' as AtmosphereModel,
+  zenithAttenuation: 0.05
 })
 
 const report = computed(() => store.linkReport)
 const job = computed(() => store.linkJob)
+
+const interferenceForm = reactive({
+  interfererIds: [] as string[],
+  thresholdCiDb: 10
+})
+
+const interference = computed(() => store.interferenceReport)
+
+const chart = computed(() => {
+  const curve = report.value?.curve ?? []
+  if (curve.length === 0) return null
+  const stride = Math.max(1, Math.ceil(curve.length / 160))
+  const picked = curve.filter((_, index) => index % stride === 0)
+  const values = picked.map((point) => point.margin_db)
+  const min = Math.min(...values, -3)
+  const max = Math.max(...values, 3)
+  const span = max - min || 1
+  const width = 300
+  const height = 96
+  const points = values
+    .map((value, index) => {
+      const x = (index / Math.max(picked.length - 1, 1)) * width
+      const y = height - ((value - min) / span) * height
+      return `${x.toFixed(2)},${y.toFixed(2)}`
+    })
+    .join(' ')
+  const zeroY = (height - ((0 - min) / span) * height).toFixed(2)
+  return { points, zeroY, width, height, min, max }
+})
 
 function syncDefaults() {
   const data = store.current?.data
@@ -57,7 +95,11 @@ async function onRun() {
     misc_loss_db: form.miscLossDb,
     system_noise_temp_k: form.noiseTempK,
     bandwidth_hz: form.bandwidthKhz * 1000,
-    required_cn0_dbhz: form.requiredCn0Dbm
+    required_cn0_dbhz: form.requiredCn0Dbm,
+    satellite_antenna_pattern: form.pattern,
+    satellite_pattern_exponent: form.patternExponent,
+    atmosphere_model: form.atmosphere,
+    zenith_attenuation_db: form.zenithAttenuation
   }
   try {
     const result = await store.runLink({
@@ -81,6 +123,56 @@ async function onExportCsv() {
   if (!current) return
   try {
     await downloadJobCsv(current.id, `link-budget-${current.id.slice(0, 8)}.csv`)
+  } catch (error) {
+    ElMessage.error(errorText(error))
+  }
+}
+
+async function onRunInterference() {
+  if (!form.satelliteId || !form.stationId) {
+    ElMessage.warning(t('linkSelectRequired'))
+    return
+  }
+  if (interferenceForm.interfererIds.length === 0) {
+    ElMessage.warning(t('interferenceSelectRequired'))
+    return
+  }
+  const options: LinkOptions = {
+    frequency_hz: form.frequencyMhz * 1e6,
+    tx_power_dbw: form.txPowerDbw,
+    tx_gain_db: form.txGainDb,
+    rx_gain_db: form.rxGainDb,
+    misc_loss_db: form.miscLossDb,
+    system_noise_temp_k: form.noiseTempK,
+    bandwidth_hz: form.bandwidthKhz * 1000,
+    required_cn0_dbhz: form.requiredCn0Dbm,
+    satellite_antenna_pattern: form.pattern,
+    satellite_pattern_exponent: form.patternExponent,
+    atmosphere_model: form.atmosphere,
+    zenith_attenuation_db: form.zenithAttenuation
+  }
+  try {
+    await store.runInterference({
+      satelliteId: form.satelliteId,
+      stationId: form.stationId,
+      interfererIds: interferenceForm.interfererIds,
+      start: form.start,
+      end: form.end,
+      stepSeconds: form.stepSeconds,
+      thresholdCiDb: interferenceForm.thresholdCiDb,
+      options
+    })
+    ElMessage.success(t('interferenceResult'))
+  } catch (error) {
+    ElMessage.error(`${t('interferenceFailed')}: ${errorText(error)}`)
+  }
+}
+
+async function onExportInterferenceCsv() {
+  const current = store.interferenceJob
+  if (!current) return
+  try {
+    await downloadJobCsv(current.id, `interference-${current.id.slice(0, 8)}.csv`)
   } catch (error) {
     ElMessage.error(errorText(error))
   }
@@ -172,6 +264,45 @@ function formatUtcString(value: string) {
         <el-input-number v-model="form.requiredCn0Dbm" :min="0" :max="150" :step="1" controls-position="right" style="width: 100%" />
       </el-form-item>
     </div>
+
+    <div class="section-title">{{ t('linkAdvancedModel') }}</div>
+    <div class="grid2">
+      <el-form-item :label="t('linkSatellitePattern')">
+        <el-select v-model="form.pattern" style="width: 100%">
+          <el-option :label="t('linkPatternOmni')" value="omni" />
+          <el-option :label="t('linkPatternCosine')" value="cosine" />
+        </el-select>
+      </el-form-item>
+      <el-form-item :label="t('linkPatternExponent')">
+        <el-input-number
+          v-model="form.patternExponent"
+          :min="0.5"
+          :max="8"
+          :step="0.5"
+          :disabled="form.pattern === 'omni'"
+          controls-position="right"
+          style="width: 100%"
+        />
+      </el-form-item>
+      <el-form-item :label="t('linkAtmosphere')">
+        <el-select v-model="form.atmosphere" style="width: 100%">
+          <el-option :label="t('linkAtmosphereNone')" value="none" />
+          <el-option :label="t('linkAtmosphereSimple')" value="simple" />
+          <el-option :label="t('linkAtmosphereItu')" value="itu" />
+        </el-select>
+      </el-form-item>
+      <el-form-item :label="t('linkZenithAttenuation')">
+        <el-input-number
+          v-model="form.zenithAttenuation"
+          :min="0"
+          :max="20"
+          :step="0.01"
+          :disabled="form.atmosphere === 'none'"
+          controls-position="right"
+          style="width: 100%"
+        />
+      </el-form-item>
+    </div>
   </el-form>
 
   <el-button type="primary" size="small" class="full" :loading="store.linkBusy" @click="onRun">
@@ -220,6 +351,33 @@ function formatUtcString(value: string) {
         <b>{{ report.mean_free_space_loss_db.toFixed(2) }} dB</b>
       </div>
     </div>
+    <div class="stats">
+      <div class="stat">
+        <span>{{ t('linkMeanAtmosphere') }}</span>
+        <b>{{ report.mean_atmospheric_loss_db.toFixed(2) }} dB</b>
+      </div>
+      <div class="stat">
+        <span>{{ t('linkMaxAtmosphere') }}</span>
+        <b>{{ report.max_atmospheric_loss_db.toFixed(2) }} dB</b>
+      </div>
+      <div class="stat">
+        <span>{{ t('linkSatellitePattern') }}</span>
+        <b>{{ report.satellite_antenna_pattern === 'cosine' ? 'Cosine' : 'Omni' }}</b>
+      </div>
+    </div>
+
+    <div v-if="chart" class="curve">
+      <div class="curve-title">{{ t('linkMarginCurve') }}</div>
+      <svg :viewBox="`0 0 ${chart.width} ${chart.height}`" preserveAspectRatio="none">
+        <line x1="0" :y1="chart.zeroY" :x2="chart.width" :y2="chart.zeroY" class="zero" />
+        <polyline :points="chart.points" class="margin" />
+      </svg>
+      <div class="curve-axis">
+        <span>{{ chart.min.toFixed(0) }} dB</span>
+        <span>{{ t('linkCurveMargin') }}</span>
+        <span>{{ chart.max.toFixed(0) }} dB</span>
+      </div>
+    </div>
 
     <el-table :data="report.windows" size="small" height="260" class="table">
       <el-table-column prop="index" :label="t('windowIndex')" width="48" />
@@ -255,6 +413,82 @@ function formatUtcString(value: string) {
     </el-button>
   </template>
   <el-empty v-else :description="t('noLinkResult')" :image-size="56" />
+
+  <div class="section-title">{{ t('interferenceAnalysis') }}</div>
+  <el-form label-position="top" size="small" class="form">
+    <el-form-item :label="t('interferenceSources')">
+      <el-select
+        v-model="interferenceForm.interfererIds"
+        multiple
+        collapse-tags
+        collapse-tags-tooltip
+        :placeholder="t('interferenceSourcesPlaceholder')"
+        style="width: 100%"
+      >
+        <el-option
+          v-for="item in (store.current?.data.satellites ?? []).filter((satellite) => satellite.id !== form.satelliteId)"
+          :key="item.id"
+          :label="item.name"
+          :value="item.id"
+        />
+      </el-select>
+    </el-form-item>
+    <el-form-item :label="t('interferenceThreshold')">
+      <el-input-number v-model="interferenceForm.thresholdCiDb" :min="-50" :max="100" :step="1" controls-position="right" style="width: 100%" />
+    </el-form-item>
+  </el-form>
+
+  <el-button type="primary" size="small" class="full" :loading="store.interferenceBusy" @click="onRunInterference">
+    {{ store.interferenceBusy ? t('interferenceRunning') : t('interferenceRun') }}
+  </el-button>
+
+  <el-alert
+    v-if="store.interferenceJob?.status === 'failed'"
+    type="error"
+    :closable="false"
+    class="job-error"
+    :title="store.interferenceJob.error ?? t('interferenceFailed')"
+  />
+
+  <template v-if="interference">
+    <div class="section-title">{{ t('interferenceResult') }}</div>
+    <div class="model-line">
+      {{ interference.desired_satellite_name }} → {{ interference.ground_station_name }} ·
+      {{ interference.interferers.length }} {{ t('interferenceSources') }}
+    </div>
+    <div class="stats">
+      <div class="stat">
+        <span>{{ t('interferenceMinCi') }}</span>
+        <b :class="interference.min_ci_db >= interference.threshold_ci_db ? 'ok' : 'bad'">
+          {{ interference.min_ci_db.toFixed(2) }} dB
+        </b>
+      </div>
+      <div class="stat">
+        <span>{{ t('interferenceMeanCi') }}</span>
+        <b>{{ interference.mean_ci_db.toFixed(2) }} dB</b>
+      </div>
+      <div class="stat">
+        <span>{{ t('interferenceDegraded') }}</span>
+        <b>{{ (interference.degraded_ratio * 100).toFixed(1) }}%</b>
+      </div>
+    </div>
+    <el-table :data="interference.interferers" size="small" height="150" class="table">
+      <el-table-column prop="satellite_name" :label="t('accessSatellite')" min-width="110" />
+      <el-table-column :label="t('interferenceMinCi')" width="92">
+        <template #default="{ row }">{{ row.min_ci_db.toFixed(2) }}</template>
+      </el-table-column>
+      <el-table-column :label="t('interferenceMeanCi')" width="92">
+        <template #default="{ row }">{{ row.mean_ci_db.toFixed(2) }}</template>
+      </el-table-column>
+      <el-table-column :label="t('interferenceSamples')" min-width="74">
+        <template #default="{ row }">{{ row.visible_samples }}</template>
+      </el-table-column>
+    </el-table>
+    <el-button size="small" :icon="Download" class="full" @click="onExportInterferenceCsv">
+      {{ t('exportCsv') }}
+    </el-button>
+  </template>
+  <el-empty v-else :description="t('interferenceNoResult')" :image-size="56" />
 </template>
 
 <style scoped lang="scss">
@@ -324,6 +558,48 @@ function formatUtcString(value: string) {
     font-weight: 600;
     font-variant-numeric: tabular-nums;
   }
+}
+
+.curve {
+  margin: 4px 0 10px;
+  padding: 8px;
+  border: 1px solid var(--kst-border);
+  border-radius: 6px;
+  background: rgba(6, 12, 22, 0.4);
+
+  svg {
+    width: 100%;
+    height: 96px;
+    display: block;
+  }
+
+  .margin {
+    fill: none;
+    stroke: #4fc3f7;
+    stroke-width: 1.6;
+    vector-effect: non-scaling-stroke;
+  }
+
+  .zero {
+    stroke: #ffb74d;
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+    vector-effect: non-scaling-stroke;
+  }
+}
+
+.curve-title {
+  font-size: 10.5px;
+  color: var(--kst-text-dim);
+  margin-bottom: 4px;
+}
+
+.curve-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9.5px;
+  color: var(--kst-text-dim);
+  margin-top: 4px;
 }
 
 .ok {

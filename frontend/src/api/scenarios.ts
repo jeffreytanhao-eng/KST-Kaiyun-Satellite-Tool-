@@ -1,4 +1,5 @@
 import { request } from './http'
+import type { LinkOptions, RadarOptions } from './jobs'
 
 export type PropagatorType = 'sgp4' | 'numerical'
 export type AttitudeMode = 'nadir' | 'sun' | 'fixed'
@@ -22,6 +23,8 @@ export interface SatelliteObject {
   integrator_tolerance?: number
   enable_j2?: boolean
   enable_drag?: boolean
+  link_options?: LinkOptions | null
+  radar_options?: RadarOptions | null
 }
 
 export interface GroundStationObject {
@@ -56,10 +59,28 @@ export interface SensorObject {
   max_range_km: number
 }
 
+export type ConstellationType = 'walker_delta' | 'walker_star' | 'streets'
+
+export interface ConstellationObject {
+  id: string
+  name: string
+  enabled: boolean
+  constellation_type: ConstellationType
+  altitude_km: number
+  inclination_deg: number
+  total_satellites: number
+  planes: number
+  phasing: number
+  color_by_plane: boolean
+  epoch_utc?: string | null
+  satellite_ids: string[]
+}
+
 export interface ScenarioData {
   satellites: SatelliteObject[]
   ground_stations: GroundStationObject[]
   sensors: SensorObject[]
+  constellations: ConstellationObject[]
 }
 
 export interface Scenario {
@@ -121,7 +142,7 @@ export function importScenario(payload: ScenarioPayload) {
 }
 
 export function emptyScenarioData(): ScenarioData {
-  return { satellites: [], ground_stations: [], sensors: [] }
+  return { satellites: [], ground_stations: [], sensors: [], constellations: [] }
 }
 
 export interface SpaceTrackTle {

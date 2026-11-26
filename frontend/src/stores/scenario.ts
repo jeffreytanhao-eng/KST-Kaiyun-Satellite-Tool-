@@ -4,6 +4,7 @@ import { defineStore } from 'pinia'
 import {
   createScenario,
   deleteScenario,
+  emptyScenarioData,
   getScenario,
   importScenario,
   listScenarios,
@@ -17,15 +18,22 @@ import {
   createJob,
   waitForJob,
   type AccessReport,
+  type ConstellationAnalysisReport,
   type CoverageRegion,
   type CoverageReport,
   type EnvironmentReport,
+  type InterferenceReport,
   type Job,
   type LinkBudgetReport,
   type LinkOptions,
   type PropagationCompareReport,
-  type PropagationReport
+  type PropagationReport,
+  type RadarOptions,
+  type RadarReport,
+  type ReportDocument,
+  type ReportRequest
 } from '@/api/jobs'
+import type { ConstellationGenerationReport } from '@/api/constellations'
 
 const DEMO_TLE = {
   leo: {
@@ -78,6 +86,22 @@ export const useScenarioStore = defineStore('scenario', () => {
   const linkJob = ref<Job | null>(null)
   const linkBusy = ref(false)
 
+  const constellationAnalysis = ref<ConstellationAnalysisReport | null>(null)
+  const constellationAnalysisJob = ref<Job | null>(null)
+  const constellationAnalysisBusy = ref(false)
+
+  const radarReport = ref<RadarReport | null>(null)
+  const radarJob = ref<Job | null>(null)
+  const radarBusy = ref(false)
+
+  const interferenceReport = ref<InterferenceReport | null>(null)
+  const interferenceJob = ref<Job | null>(null)
+  const interferenceBusy = ref(false)
+
+  const reportDocument = ref<ReportDocument | null>(null)
+  const reportJob = ref<Job | null>(null)
+  const reportBusy = ref(false)
+
   const hasSatellites = computed(() => (current.value?.data.satellites.length ?? 0) > 0)
   const hasStations = computed(
     () => (current.value?.data.ground_stations.length ?? 0) > 0
@@ -96,6 +120,14 @@ export const useScenarioStore = defineStore('scenario', () => {
     compareJob.value = null
     linkReport.value = null
     linkJob.value = null
+    constellationAnalysis.value = null
+    constellationAnalysisJob.value = null
+    radarReport.value = null
+    radarJob.value = null
+    interferenceReport.value = null
+    interferenceJob.value = null
+    reportDocument.value = null
+    reportJob.value = null
   }
 
   async function loadList() {
@@ -117,7 +149,11 @@ export const useScenarioStore = defineStore('scenario', () => {
     current.value = await getScenario(current.value.id)
   }
 
-  async function create(name: string, description = '', data: ScenarioData = { satellites: [], ground_stations: [], sensors: [] }) {
+  async function create(
+    name: string,
+    description = '',
+    data: ScenarioData = emptyScenarioData()
+  ) {
     const created = await createScenario({ name, description, data })
     await loadList()
     await select(created.id)
@@ -212,7 +248,8 @@ export const useScenarioStore = defineStore('scenario', () => {
           target_station_id: null,
           max_range_km: 6000
         }
-      ]
+      ],
+      constellations: []
     }
     return create('示例场景 · 多对象分析', '包含 3 颗卫星、2 个地面站与 2 个传感器的演示场景', data)
   }
@@ -263,6 +300,9 @@ export const useScenarioStore = defineStore('scenario', () => {
     }
     if (!Array.isArray(data.sensors)) {
       data.sensors = []
+    }
+    if (!Array.isArray(data.constellations)) {
+      data.constellations = []
     }
     const created = await importScenario({
       name: candidate.name?.trim() || '导入场景',
@@ -519,6 +559,172 @@ export const useScenarioStore = defineStore('scenario', () => {
     }
   }
 
+  /** 将后端生成的星座卫星与配置合并进当前场景。 */
+  async function addConstellation(report: ConstellationGenerationReport) {
+    if (!current.value) return 0
+    const data = current.value.data
+    const existing = new Set(data.satellites.map((satellite) => satellite.id))
+    const additions = report.satellites.filter((satellite) => !existing.has(satellite.id))
+    if (data.satellites.length + additions.length > 100) {
+      throw new Error('卫星总数将超过 100 颗上限，请减少星座规模')
+    }
+    const next: ScenarioData = {
+      satellites: [...data.satellites, ...additions],
+      ground_stations: data.ground_stations,
+      sensors: data.sensors,
+      constellations: [...(data.constellations ?? []), report.constellation]
+    }
+    await saveData(next)
+    return additions.length
+  }
+
+  async function runConstellationAnalysis(params: {
+    satelliteIds?: string[]
+    stationIds?: string[]
+    start: Date
+    end: Date
+    stepSeconds?: number
+    region: CoverageRegion
+    gridStepDeg?: number
+    minElevationDeg?: number
+  }) {
+    if (!current.value || constellationAnalysisBusy.value) return null
+    constellationAnalysisBusy.value = true
+    constellationAnalysis.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'constellation_analysis',
+        params: {
+          ...(params.satelliteIds && params.satelliteIds.length > 0
+            ? { satellite_ids: params.satelliteIds }
+            : {}),
+          ...(params.stationIds && params.stationIds.length > 0
+            ? { station_ids: params.stationIds }
+            : {}),
+          start: params.start.toISOString(),
+          end: params.end.toISOString(),
+          step_seconds: params.stepSeconds ?? 60,
+          region: params.region,
+          grid_step_deg: params.gridStepDeg ?? 5,
+          min_elevation_deg: params.minElevationDeg ?? 5
+        }
+      })
+      constellationAnalysisJob.value = job
+      const done = await waitForJob(job.id, 300_000)
+      constellationAnalysisJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '星座批量分析失败')
+      }
+      const report = done.result as ConstellationAnalysisReport
+      constellationAnalysis.value = report
+      coverageReport.value = report.coverage
+      return report
+    } finally {
+      constellationAnalysisBusy.value = false
+    }
+  }
+
+  async function runRadar(params: {
+    satelliteId: string
+    stationId: string
+    start: Date
+    end: Date
+    stepSeconds?: number
+    options: RadarOptions
+  }) {
+    if (!current.value || radarBusy.value) return null
+    radarBusy.value = true
+    radarReport.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'radar',
+        params: {
+          satellite_id: params.satelliteId,
+          ground_station_id: params.stationId,
+          start: params.start.toISOString(),
+          end: params.end.toISOString(),
+          step_seconds: params.stepSeconds ?? 30,
+          options: params.options
+        }
+      })
+      radarJob.value = job
+      const done = await waitForJob(job.id)
+      radarJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '雷达分析失败')
+      }
+      radarReport.value = done.result as RadarReport
+      return radarReport.value
+    } finally {
+      radarBusy.value = false
+    }
+  }
+
+  async function runInterference(params: {
+    satelliteId: string
+    stationId: string
+    interfererIds: string[]
+    start: Date
+    end: Date
+    stepSeconds?: number
+    thresholdCiDb?: number
+    options: LinkOptions
+  }) {
+    if (!current.value || interferenceBusy.value) return null
+    interferenceBusy.value = true
+    interferenceReport.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'interference',
+        params: {
+          satellite_id: params.satelliteId,
+          ground_station_id: params.stationId,
+          interferer_ids: params.interfererIds,
+          start: params.start.toISOString(),
+          end: params.end.toISOString(),
+          step_seconds: params.stepSeconds ?? 30,
+          options: params.options,
+          threshold_ci_db: params.thresholdCiDb ?? 10
+        }
+      })
+      interferenceJob.value = job
+      const done = await waitForJob(job.id)
+      interferenceJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '干扰分析失败')
+      }
+      interferenceReport.value = done.result as InterferenceReport
+      return interferenceReport.value
+    } finally {
+      interferenceBusy.value = false
+    }
+  }
+
+  async function runReport(params: ReportRequest) {    if (!current.value || reportBusy.value) return null
+    reportBusy.value = true
+    reportDocument.value = null
+    try {
+      const job = await createJob({
+        scenario_id: current.value.id,
+        kind: 'report',
+        params: { ...params }
+      })
+      reportJob.value = job
+      const done = await waitForJob(job.id, 300_000)
+      reportJob.value = done
+      if (done.status !== 'succeeded') {
+        throw new Error(done.error ?? '报告生成失败')
+      }
+      reportDocument.value = done.result as ReportDocument
+      return reportDocument.value
+    } finally {
+      reportBusy.value = false
+    }
+  }
+
   return {
     scenarios,
     current,
@@ -542,6 +748,18 @@ export const useScenarioStore = defineStore('scenario', () => {
     linkReport,
     linkJob,
     linkBusy,
+    constellationAnalysis,
+    constellationAnalysisJob,
+    constellationAnalysisBusy,
+    radarReport,
+    radarJob,
+    radarBusy,
+    interferenceReport,
+    interferenceJob,
+    interferenceBusy,
+    reportDocument,
+    reportJob,
+    reportBusy,
     hasSatellites,
     hasStations,
     loadList,
@@ -559,6 +777,11 @@ export const useScenarioStore = defineStore('scenario', () => {
     runEnvironment,
     runComparison,
     runLink,
+    addConstellation,
+    runConstellationAnalysis,
+    runRadar,
+    runInterference,
+    runReport,
     resetResults
   }
 })

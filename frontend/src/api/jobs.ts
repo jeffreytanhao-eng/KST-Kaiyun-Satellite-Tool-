@@ -8,6 +8,10 @@ export type JobKind =
   | 'environment'
   | 'propagation_compare'
   | 'link_budget'
+  | 'constellation_analysis'
+  | 'radar'
+  | 'report'
+  | 'interference'
 
 export interface Job<T = unknown> {
   id: string
@@ -204,6 +208,9 @@ export interface PropagationCompareReport {
   samples: CompareSample[]
 }
 
+export type AntennaPattern = 'omni' | 'cosine'
+export type AtmosphereModel = 'none' | 'simple' | 'itu'
+
 export interface LinkOptions {
   frequency_hz: number
   tx_power_dbw: number
@@ -213,17 +220,31 @@ export interface LinkOptions {
   system_noise_temp_k: number
   bandwidth_hz: number
   required_cn0_dbhz: number
+  satellite_antenna_pattern?: AntennaPattern
+  satellite_pattern_exponent?: number
+  atmosphere_model?: AtmosphereModel
+  zenith_attenuation_db?: number
 }
 
 export interface LinkSample {
   t_seconds: number
   elevation_deg: number
   range_km: number
+  off_nadir_deg: number
+  pattern_gain_db: number
   free_space_loss_db: number
   atmospheric_loss_db: number
   received_power_dbw: number
   cn0_dbhz: number
   eb_n0_db: number
+  margin_db: number
+}
+
+export interface LinkCurvePoint {
+  t_seconds: number
+  elevation_deg: number
+  range_km: number
+  cn0_dbhz: number
   margin_db: number
 }
 
@@ -261,7 +282,194 @@ export interface LinkBudgetReport {
   mean_margin_db: number
   max_range_km: number
   mean_free_space_loss_db: number
+  satellite_antenna_pattern: AntennaPattern
+  satellite_pattern_exponent: number
+  atmosphere_model: AtmosphereModel
+  mean_atmospheric_loss_db: number
+  max_atmospheric_loss_db: number
+  curve: LinkCurvePoint[]
   windows: LinkWindow[]
+}
+
+export interface RevisitPointStat {
+  latitude_deg: number
+  longitude_deg: number
+  access_count: number
+  visible_seconds: number
+  mean_gap_seconds: number
+  max_gap_seconds: number
+  max_elevation_deg: number
+  covered: boolean
+}
+
+export interface StationAccessStat {
+  station_id: string
+  station_name: string
+  window_count: number
+  total_access_seconds: number
+  mean_gap_seconds: number
+  max_gap_seconds: number
+  first_access_utc: string | null
+  last_access_end_utc: string | null
+}
+
+export interface ConstellationAnalysisReport {
+  satellite_ids: string[]
+  satellite_names: string[]
+  start: string
+  end: string
+  step_seconds: number
+  min_elevation_deg: number
+  region: CoverageRegion
+  grid_step_deg: number
+  total_points: number
+  covered_points: number
+  coverage_ratio: number
+  multi_covered_points: number
+  mean_access_count: number
+  mean_revisit_seconds: number
+  max_gap_seconds: number
+  station_stats: StationAccessStat[]
+  coverage: CoverageReport
+  revisit_points: RevisitPointStat[]
+  note: string
+}
+
+export interface RadarOptions {
+  frequency_hz: number
+  tx_power_w: number
+  tx_gain_db: number
+  rx_gain_db: number
+  system_loss_db: number
+  noise_figure_db: number
+  bandwidth_hz: number
+  target_rcs_m2: number
+  required_snr_db: number
+  pulses_integrated?: number
+  min_elevation_deg?: number | null
+}
+
+export interface RadarSample {
+  t_seconds: number
+  elevation_deg: number
+  range_km: number
+  snr_db: number
+  detected: boolean
+}
+
+export interface RadarWindow {
+  index: number
+  start_utc: string
+  end_utc: string
+  start_seconds: number
+  end_seconds: number
+  duration_seconds: number
+  max_elevation_deg: number
+  min_range_km: number
+  max_range_km: number
+  max_snr_db: number
+  detected_seconds: number
+  samples: RadarSample[]
+}
+
+export interface RadarReport {
+  satellite_id: string
+  satellite_name: string
+  ground_station_id: string
+  ground_station_name: string
+  start: string
+  end: string
+  step_seconds: number
+  frequency_hz: number
+  bandwidth_hz: number
+  tx_power_w: number
+  target_rcs_m2: number
+  required_snr_db: number
+  integration_gain_db: number
+  max_detection_range_km: number
+  window_count: number
+  detected_window_count: number
+  total_detection_seconds: number
+  min_range_km: number
+  max_range_km: number
+  samples: RadarSample[]
+  windows: RadarWindow[]
+}
+
+export interface InterferenceSample {
+  t_seconds: number
+  elevation_deg: number
+  range_km: number
+  desired_cn0_dbhz: number
+  interference_cn0_dbhz: number
+  ci_db: number
+  interferer_count: number
+}
+
+export interface InterfererStat {
+  satellite_id: string
+  satellite_name: string
+  min_ci_db: number
+  mean_ci_db: number
+  visible_samples: number
+}
+
+export interface InterferenceReport {
+  desired_satellite_id: string
+  desired_satellite_name: string
+  ground_station_id: string
+  ground_station_name: string
+  start: string
+  end: string
+  step_seconds: number
+  frequency_hz: number
+  threshold_ci_db: number
+  sample_count: number
+  degraded_samples: number
+  degraded_ratio: number
+  min_ci_db: number
+  mean_ci_db: number
+  interferers: InterfererStat[]
+  samples: InterferenceSample[]
+}
+
+export interface ReportRequest {
+  title?: string
+  start: string
+  end: string
+  step_seconds?: number
+  satellite_ids?: string[]
+  station_ids?: string[]
+  region?: CoverageRegion
+  grid_step_deg?: number
+  min_elevation_deg?: number
+  include_access?: boolean
+  include_coverage?: boolean
+  include_link?: boolean
+  include_radar?: boolean
+  link_options?: LinkOptions
+  radar_options?: RadarOptions
+}
+
+export interface ReportStats {
+  satellite_count: number
+  station_count: number
+  access_pair_count: number
+  access_window_count: number
+  coverage_ratio: number | null
+  max_gap_seconds: number | null
+  min_link_margin_db: number | null
+  radar_max_detection_range_km: number | null
+}
+
+export interface ReportDocument {
+  title: string
+  generated_at: string
+  start: string
+  end: string
+  stats: ReportStats
+  markdown: string
+  html: string
 }
 
 export interface EnvironmentSample {
@@ -340,6 +548,29 @@ export async function downloadJobCsv(jobId: string, filename: string) {
   if (!response.ok) {
     const data = await response.json().catch(() => null)
     throw new Error(data?.error?.message ?? `导出失败（HTTP ${response.status}）`)
+  }
+  const blob = await response.blob()
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+/** 下载报告（HTML 或 Markdown，后端生成，带鉴权）。 */
+export async function downloadJobReport(
+  jobId: string,
+  filename: string,
+  format: 'html' | 'markdown'
+) {
+  const token = getToken()
+  const response = await fetch(`/api/v1/jobs/${jobId}/report?format=${format}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined
+  })
+  if (!response.ok) {
+    const data = await response.json().catch(() => null)
+    throw new Error(data?.error?.message ?? `报告导出失败（HTTP ${response.status}）`)
   }
   const blob = await response.blob()
   const url = URL.createObjectURL(blob)

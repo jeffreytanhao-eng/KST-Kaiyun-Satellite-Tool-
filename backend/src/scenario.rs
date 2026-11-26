@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-/// 场景内容：卫星、地面站与传感器对象集合，整体以 JSONB 存储。
+/// 场景内容：卫星、地面站、传感器与星座配置，整体以 JSONB 存储。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScenarioData {
     #[serde(default)]
@@ -13,6 +13,9 @@ pub struct ScenarioData {
     pub ground_stations: Vec<GroundStationObject>,
     #[serde(default)]
     pub sensors: Vec<SensorObject>,
+    /// 星座生成记录：保存构型参数与生成出的卫星 id，便于复现与报告。
+    #[serde(default)]
+    pub constellations: Vec<ConstellationObject>,
 }
 
 /// 卫星对象：使用 TLE 描述，可选择 SGP4 或数值积分传播。
@@ -61,6 +64,36 @@ pub struct SatelliteObject {
     /// 是否启用大气阻力（仅数值积分）。
     #[serde(default = "default_true")]
     pub enable_drag: bool,
+    /// 该卫星的默认链路参数（可选，供前端预填与自动化调用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_options: Option<crate::link::LinkOptions>,
+    /// 该卫星的默认雷达参数（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radar_options: Option<crate::radar::RadarOptions>,
+}
+
+/// 星座构型生成记录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstellationObject {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `walker_delta`、`walker_star` 或 `streets`。
+    pub constellation_type: String,
+    pub altitude_km: f64,
+    pub inclination_deg: f64,
+    pub total_satellites: u32,
+    pub planes: u32,
+    #[serde(default)]
+    pub phasing: u32,
+    #[serde(default)]
+    pub color_by_plane: bool,
+    #[serde(default)]
+    pub epoch_utc: Option<String>,
+    /// 该星座生成出的卫星 id 列表。
+    #[serde(default)]
+    pub satellite_ids: Vec<String>,
 }
 
 /// 地面站对象：大地坐标与最小仰角约束。
@@ -437,6 +470,76 @@ impl ScenarioData {
                     "传感器 {} 的最大作用距离需在 [1, 100000] km 内",
                     sensor.name
                 )));
+            }
+        }
+
+        if self.constellations.len() > 20 {
+            return Err(AppError::BadRequest("星座配置数量不能超过 20 个".into()));
+        }
+        let mut constellation_ids = HashSet::new();
+        for constellation in &self.constellations {
+            if constellation.id.trim().is_empty() {
+                return Err(AppError::BadRequest("星座配置缺少 id".into()));
+            }
+            if !constellation_ids.insert(constellation.id.as_str()) {
+                return Err(AppError::BadRequest(format!(
+                    "星座配置 id 重复：{}",
+                    constellation.id
+                )));
+            }
+            if constellation.name.trim().is_empty() {
+                return Err(AppError::BadRequest("星座名称不能为空".into()));
+            }
+            match constellation.constellation_type.as_str() {
+                "walker_delta" | "walker_star" | "streets" => {}
+                other => {
+                    return Err(AppError::BadRequest(format!(
+                        "星座 {} 的构型类型无效：{other}",
+                        constellation.name
+                    )));
+                }
+            }
+            if !constellation.altitude_km.is_finite()
+                || !(160.0..=50_000.0).contains(&constellation.altitude_km)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "星座 {} 的轨道高度需在 [160, 50000] km 内",
+                    constellation.name
+                )));
+            }
+            if !constellation.inclination_deg.is_finite()
+                || !(0.0..=180.0).contains(&constellation.inclination_deg)
+            {
+                return Err(AppError::BadRequest(format!(
+                    "星座 {} 的倾角需在 [0, 180] 度内",
+                    constellation.name
+                )));
+            }
+            if !(2..=100).contains(&constellation.total_satellites) {
+                return Err(AppError::BadRequest(format!(
+                    "星座 {} 的卫星总数需在 [2, 100] 内",
+                    constellation.name
+                )));
+            }
+            if constellation.planes == 0 || constellation.planes > constellation.total_satellites {
+                return Err(AppError::BadRequest(format!(
+                    "星座 {} 的轨道面数需在 [1, 卫星总数] 内",
+                    constellation.name
+                )));
+            }
+            if constellation.phasing >= constellation.planes {
+                return Err(AppError::BadRequest(format!(
+                    "星座 {} 的相位因子需小于轨道面数",
+                    constellation.name
+                )));
+            }
+            for satellite_id in &constellation.satellite_ids {
+                if !satellite_ids.contains(satellite_id.as_str()) {
+                    return Err(AppError::BadRequest(format!(
+                        "星座 {} 引用了不存在的卫星：{}",
+                        constellation.name, satellite_id
+                    )));
+                }
             }
         }
 

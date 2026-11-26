@@ -941,6 +941,59 @@ pub fn compute_access(
     })
 }
 
+/// 按 id 列表或启用状态筛选卫星。
+fn select_satellites<'a>(
+    data: &'a ScenarioData,
+    satellite_ids: Option<&[String]>,
+) -> Result<Vec<&'a SatelliteObject>, String> {
+    let mut satellites = Vec::new();
+    for satellite in &data.satellites {
+        let selected = match satellite_ids {
+            Some(ids) => ids.iter().any(|id| id == &satellite.id),
+            None => satellite.enabled,
+        };
+        if selected {
+            satellites.push(satellite);
+        }
+    }
+    if satellites.is_empty() {
+        return Err("请至少选择一颗卫星".into());
+    }
+    Ok(satellites)
+}
+
+/// 一次性传播所选卫星的地固系位置序列。
+fn satellite_positions(
+    satellites: &[&SatelliteObject],
+    start: DateTime<Utc>,
+    total_seconds: f64,
+    step_seconds: f64,
+    sample_count: usize,
+) -> Result<Vec<Vec<[f64; 3]>>, String> {
+    let mut positions = Vec::with_capacity(satellites.len());
+    for satellite in satellites {
+        let series: Vec<[f64; 3]> = if satellite.propagator_type == "numerical" {
+            numerical::propagate(satellite, start, total_seconds, step_seconds)?
+                .states
+                .into_iter()
+                .map(|state| state.position)
+                .collect()
+        } else {
+            let (elements, constants) = prepare(satellite)?;
+            let mut values = Vec::with_capacity(sample_count);
+            for sample_index in 0..sample_count {
+                let t_seconds = sample_index as f64 * step_seconds;
+                let time =
+                    start + ChronoDuration::milliseconds((t_seconds * 1000.0).round() as i64);
+                values.push(propagate_ecef(&elements, &constants, time)?);
+            }
+            values
+        };
+        positions.push(series);
+    }
+    Ok(positions)
+}
+
 /// 区域网格覆盖计算：统计每个网格点对选中卫星的可见时长与覆盖次数。
 #[allow(clippy::too_many_arguments)]
 pub fn compute_coverage(
@@ -990,42 +1043,13 @@ pub fn compute_coverage(
         ));
     }
 
-    let mut satellites = Vec::new();
-    for satellite in &data.satellites {
-        let selected = match satellite_ids {
-            Some(ids) => ids.iter().any(|id| id == &satellite.id),
-            None => satellite.enabled,
-        };
-        if selected {
-            satellites.push(satellite);
-        }
-    }
+    let satellites = select_satellites(data, satellite_ids)?;
     if satellites.is_empty() {
         return Err("请至少选择一颗卫星".into());
     }
 
     // 每颗卫星只传播一次，后续按网格点复用位置序列。
-    let mut positions: Vec<Vec<[f64; 3]>> = Vec::with_capacity(satellites.len());
-    for satellite in &satellites {
-        let series: Vec<[f64; 3]> = if satellite.propagator_type == "numerical" {
-            numerical::propagate(satellite, start, total_seconds, step_seconds)?
-                .states
-                .into_iter()
-                .map(|state| state.position)
-                .collect()
-        } else {
-            let (elements, constants) = prepare(satellite)?;
-            let mut values = Vec::with_capacity(sample_count);
-            for sample_index in 0..sample_count {
-                let t_seconds = sample_index as f64 * step_seconds;
-                let time =
-                    start + ChronoDuration::milliseconds((t_seconds * 1000.0).round() as i64);
-                values.push(propagate_ecef(&elements, &constants, time)?);
-            }
-            values
-        };
-        positions.push(series);
-    }
+    let positions = satellite_positions(&satellites, start, total_seconds, step_seconds, sample_count)?;
 
     let mut points = Vec::with_capacity(point_count);
     let mut covered_points = 0usize;
@@ -1426,3 +1450,464 @@ fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dz = a[2] - b[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
+
+/// 星座批量分析的点统计。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevisitPointStat {
+    pub latitude_deg: f64,
+    pub longitude_deg: f64,
+    pub access_count: u32,
+    pub visible_seconds: f64,
+    pub mean_gap_seconds: f64,
+    pub max_gap_seconds: f64,
+    pub max_elevation_deg: f64,
+    pub covered: bool,
+}
+
+/// 地面站在星座下的 Access 统计。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationAccessStat {
+    pub station_id: String,
+    pub station_name: String,
+    pub window_count: u32,
+    pub total_access_seconds: f64,
+    pub mean_gap_seconds: f64,
+    pub max_gap_seconds: f64,
+    pub first_access_utc: Option<String>,
+    pub last_access_end_utc: Option<String>,
+}
+
+/// 星座批量覆盖 / Access 分析报告。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstellationAnalysisReport {
+    pub satellite_ids: Vec<String>,
+    pub satellite_names: Vec<String>,
+    pub start: String,
+    pub end: String,
+    pub step_seconds: f64,
+    pub min_elevation_deg: f64,
+    pub region: CoverageRegion,
+    pub grid_step_deg: f64,
+    pub total_points: usize,
+    pub covered_points: usize,
+    pub coverage_ratio: f64,
+    pub multi_covered_points: usize,
+    pub mean_access_count: f64,
+    pub mean_revisit_seconds: f64,
+    pub max_gap_seconds: f64,
+    pub station_stats: Vec<StationAccessStat>,
+    pub coverage: CoverageReport,
+    pub revisit_points: Vec<RevisitPointStat>,
+    pub note: String,
+}
+
+/// 允许的星座分析网格点上限。
+const MAX_ANALYSIS_POINTS: usize = 1_500;
+/// 允许参与批量分析的卫星上限。
+const MAX_ANALYSIS_SATELLITES: usize = 48;
+
+fn visibility_intervals(
+    series: &[[f64; 3]],
+    station_position: [f64; 3],
+    up: [f64; 3],
+    east: [f64; 3],
+    north: [f64; 3],
+    min_elevation_deg: f64,
+    step_seconds: f64,
+    total_seconds: f64,
+) -> (Vec<(f64, f64)>, f64) {
+    let mut intervals = Vec::new();
+    let mut active_start: Option<f64> = None;
+    let mut previous: Option<(f64, f64, bool)> = None;
+    let mut max_elevation = f64::NEG_INFINITY;
+
+    for (index, satellite_position) in series.iter().enumerate() {
+        let t_seconds = index as f64 * step_seconds;
+        let (elevation, _, _) =
+            look_angles_with_basis(*satellite_position, station_position, up, east, north);
+        max_elevation = max_elevation.max(elevation);
+        let visible =
+            elevation >= min_elevation_deg && !earth_occluded(station_position, *satellite_position);
+
+        if visible {
+            if active_start.is_none() {
+                let start_seconds = match previous {
+                    Some((previous_t, previous_elevation, false))
+                        if (elevation - previous_elevation).abs() > 1e-9 =>
+                    {
+                        let fraction = ((min_elevation_deg - previous_elevation)
+                            / (elevation - previous_elevation))
+                            .clamp(0.0, 1.0);
+                        previous_t + fraction * step_seconds
+                    }
+                    _ => t_seconds,
+                };
+                active_start = Some(start_seconds);
+            }
+        } else if let Some(start_seconds) = active_start.take() {
+            let end_seconds = match previous {
+                Some((previous_t, previous_elevation, true))
+                    if (previous_elevation - elevation).abs() > 1e-9 =>
+                {
+                    let fraction = ((previous_elevation - min_elevation_deg)
+                        / (previous_elevation - elevation))
+                        .clamp(0.0, 1.0);
+                    previous_t + fraction * step_seconds
+                }
+                _ => t_seconds,
+            };
+            intervals.push((start_seconds, end_seconds.max(start_seconds)));
+        }
+        previous = Some((t_seconds, elevation, visible));
+    }
+
+    if let Some(start_seconds) = active_start {
+        intervals.push((start_seconds, total_seconds));
+    }
+    (intervals, max_elevation)
+}
+
+fn merge_intervals(mut intervals: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    intervals.retain(|(start, end)| *end > *start + 1e-9);
+    intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 + 1e-6 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+/// 统计合并后窗口之间的平均/最大间隙（秒）。
+fn gap_statistics(intervals: &[(f64, f64)], total_seconds: f64) -> (f64, f64) {
+    if intervals.len() >= 2 {
+        let mut sum = 0.0_f64;
+        let mut maximum = 0.0_f64;
+        for pair in intervals.windows(2) {
+            let gap = (pair[1].0 - pair[0].1).max(0.0);
+            sum += gap;
+            maximum = maximum.max(gap);
+        }
+        (sum / (intervals.len() - 1) as f64, maximum)
+    } else if intervals.len() == 1 {
+        let gap = (total_seconds - (intervals[0].1 - intervals[0].0)).max(0.0);
+        (gap, gap)
+    } else {
+        (total_seconds, total_seconds)
+    }
+}
+
+fn interval_total(intervals: &[(f64, f64)]) -> f64 {
+    intervals.iter().map(|(start, end)| (end - start).max(0.0)).sum()
+}
+
+/// 星座批量覆盖与 Access 统计。
+#[allow(clippy::too_many_arguments)]
+pub fn compute_constellation_analysis(
+    data: &ScenarioData,
+    satellite_ids: Option<&[String]>,
+    station_ids: Option<&[String]>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    step_seconds: f64,
+    region: CoverageRegion,
+    grid_step_deg: f64,
+    min_elevation_deg: f64,
+) -> Result<ConstellationAnalysisReport, String> {
+    if !region.min_latitude_deg.is_finite()
+        || !region.max_latitude_deg.is_finite()
+        || !region.min_longitude_deg.is_finite()
+        || !region.max_longitude_deg.is_finite()
+        || !(-90.0..=90.0).contains(&region.min_latitude_deg)
+        || !(-90.0..=90.0).contains(&region.max_latitude_deg)
+        || !(-180.0..=180.0).contains(&region.min_longitude_deg)
+        || !(-180.0..=180.0).contains(&region.max_longitude_deg)
+        || region.min_latitude_deg >= region.max_latitude_deg
+        || region.min_longitude_deg >= region.max_longitude_deg
+    {
+        return Err("覆盖区域需为合法的经纬度范围（最小值必须小于最大值）".into());
+    }
+    if !grid_step_deg.is_finite() || !(0.1..=30.0).contains(&grid_step_deg) {
+        return Err("网格步长需在 [0.1, 30] 度内".into());
+    }
+    if !min_elevation_deg.is_finite() || !(0.0..=90.0).contains(&min_elevation_deg) {
+        return Err("最小仰角需在 [0, 90] 度内".into());
+    }
+
+    let total_seconds = (end - start).num_milliseconds() as f64 / 1000.0;
+    if total_seconds <= 0.0 {
+        return Err("结束时间必须晚于开始时间".into());
+    }
+    let sample_count = sample_count(total_seconds, step_seconds)?;
+
+    let latitude_steps = ((region.max_latitude_deg - region.min_latitude_deg) / grid_step_deg).ceil()
+        as usize;
+    let longitude_steps =
+        ((region.max_longitude_deg - region.min_longitude_deg) / grid_step_deg).ceil() as usize;
+    let point_count = (latitude_steps + 1) * (longitude_steps + 1);
+    if point_count > MAX_ANALYSIS_POINTS {
+        return Err(format!(
+            "星座分析网格点数为 {point_count}，超过上限 {MAX_ANALYSIS_POINTS}，请增大网格步长或缩小区域"
+        ));
+    }
+
+    let satellites = select_satellites(data, satellite_ids)?;
+    if satellites.len() > MAX_ANALYSIS_SATELLITES {
+        return Err(format!(
+            "星座分析最多支持 {MAX_ANALYSIS_SATELLITES} 颗卫星，当前 {} 颗，请减少选择",
+            satellites.len()
+        ));
+    }
+    let combinations = point_count
+        .saturating_mul(satellites.len())
+        .saturating_mul(sample_count);
+    if combinations > 200_000_000 {
+        return Err(
+            "计算规模过大（网格点×卫星数×采样点超过 2e8），请增大步长、缩小区域或减少卫星".into(),
+        );
+    }
+
+    let positions = satellite_positions(&satellites, start, total_seconds, step_seconds, sample_count)?;
+    let mut satellite_stats: Vec<CoverageSatelliteStat> = satellites
+        .iter()
+        .map(|satellite| CoverageSatelliteStat {
+            satellite_id: satellite.id.clone(),
+            satellite_name: satellite.name.clone(),
+            covered_points: 0,
+            coverage_ratio: 0.0,
+            total_visible_seconds: 0.0,
+            max_visible_seconds: 0.0,
+        })
+        .collect();
+
+    let mut coverage_points = Vec::with_capacity(point_count);
+    let mut revisit_points = Vec::with_capacity(point_count);
+    let mut covered_points = 0usize;
+    let mut multi_covered_points = 0usize;
+    let mut total_visible = 0.0_f64;
+    let mut max_visible = 0.0_f64;
+    let mut access_sum = 0.0_f64;
+    let mut revisit_sum = 0.0_f64;
+    let mut revisit_count = 0usize;
+    let mut max_gap = 0.0_f64;
+
+    for lat_index in 0..=latitude_steps {
+        let latitude_deg = (region.min_latitude_deg + lat_index as f64 * grid_step_deg)
+            .min(region.max_latitude_deg);
+        for lon_index in 0..=longitude_steps {
+            let longitude_deg = (region.min_longitude_deg + lon_index as f64 * grid_step_deg)
+                .min(region.max_longitude_deg);
+
+            let station_position = geodetic_to_ecef(latitude_deg, longitude_deg, 0.0);
+            let latitude = latitude_deg.to_radians();
+            let longitude = longitude_deg.to_radians();
+            let (sin_lat, cos_lat) = latitude.sin_cos();
+            let (sin_lon, cos_lon) = longitude.sin_cos();
+            let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
+            let east = [-sin_lon, cos_lon, 0.0];
+            let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
+
+            let mut all_intervals: Vec<(f64, f64)> = Vec::new();
+            let mut point_max_elevation = f64::NEG_INFINITY;
+            let mut contributing = 0usize;
+
+            for (satellite_index, series) in positions.iter().enumerate() {
+                let (intervals, satellite_max_elevation) = visibility_intervals(
+                    series,
+                    station_position,
+                    up,
+                    east,
+                    north,
+                    min_elevation_deg,
+                    step_seconds,
+                    total_seconds,
+                );
+                let satellite_visible = interval_total(&intervals);
+                if satellite_visible > 0.0 {
+                    contributing += 1;
+                    let stats = &mut satellite_stats[satellite_index];
+                    stats.covered_points += 1;
+                    stats.total_visible_seconds += satellite_visible;
+                    stats.max_visible_seconds =
+                        stats.max_visible_seconds.max(satellite_visible);
+                }
+                if satellite_max_elevation > point_max_elevation {
+                    point_max_elevation = satellite_max_elevation;
+                }
+                all_intervals.extend(intervals);
+            }
+
+            let merged = merge_intervals(all_intervals);
+            let visible_seconds = interval_total(&merged);
+            let covered = !merged.is_empty();
+            let (mean_gap, point_max_gap) = gap_statistics(&merged, total_seconds);
+            if contributing >= 2 {
+                multi_covered_points += 1;
+            }
+            if covered {
+                covered_points += 1;
+                total_visible += visible_seconds;
+                max_visible = max_visible.max(visible_seconds);
+                access_sum += merged.len() as f64;
+                revisit_sum += mean_gap;
+                revisit_count += 1;
+                max_gap = max_gap.max(point_max_gap);
+            }
+            let max_elevation = if point_max_elevation.is_finite() {
+                point_max_elevation
+            } else {
+                0.0
+            };
+
+            coverage_points.push(CoveragePoint {
+                latitude_deg,
+                longitude_deg,
+                visible_seconds,
+                access_count: merged.len() as u32,
+                max_elevation_deg: max_elevation,
+                covered,
+            });
+            revisit_points.push(RevisitPointStat {
+                latitude_deg,
+                longitude_deg,
+                access_count: merged.len() as u32,
+                visible_seconds,
+                mean_gap_seconds: mean_gap,
+                max_gap_seconds: point_max_gap,
+                max_elevation_deg: max_elevation,
+                covered,
+            });
+        }
+    }
+
+    let coverage_ratio = if coverage_points.is_empty() {
+        0.0
+    } else {
+        covered_points as f64 / coverage_points.len() as f64
+    };
+    for stats in &mut satellite_stats {
+        stats.coverage_ratio = if coverage_points.is_empty() {
+            0.0
+        } else {
+            stats.covered_points as f64 / coverage_points.len() as f64
+        };
+    }
+
+    let coverage = CoverageReport {
+        satellite_ids: satellites.iter().map(|item| item.id.clone()).collect(),
+        satellite_names: satellites.iter().map(|item| item.name.clone()).collect(),
+        start: format_utc(start),
+        end: format_utc(end),
+        step_seconds,
+        min_elevation_deg,
+        region,
+        grid_step_deg,
+        total_points: coverage_points.len(),
+        covered_points,
+        uncovered_points: coverage_points.len().saturating_sub(covered_points),
+        multi_covered_points,
+        coverage_ratio,
+        average_visible_seconds: if covered_points == 0 {
+            0.0
+        } else {
+            total_visible / covered_points as f64
+        },
+        max_visible_seconds: max_visible,
+        total_visible_seconds: total_visible,
+        satellite_stats,
+        points: coverage_points,
+    };
+
+    // 地面站级 Access 统计。
+    let stations: Vec<&GroundStationObject> = match station_ids {
+        Some(ids) => data
+            .ground_stations
+            .iter()
+            .filter(|station| ids.iter().any(|id| id == &station.id))
+            .collect(),
+        None => data
+            .ground_stations
+            .iter()
+            .filter(|station| station.enabled)
+            .collect(),
+    };
+    let mut station_stats = Vec::with_capacity(stations.len().min(20));
+    for station in stations.into_iter().take(20) {
+        let station_position = station_ecef(station);
+        let latitude = station.latitude_deg.to_radians();
+        let longitude = station.longitude_deg.to_radians();
+        let (sin_lat, cos_lat) = latitude.sin_cos();
+        let (sin_lon, cos_lon) = longitude.sin_cos();
+        let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
+        let east = [-sin_lon, cos_lon, 0.0];
+        let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
+        let min_elevation = min_elevation_deg.max(station.min_elevation_deg);
+
+        let mut intervals = Vec::new();
+        for series in &positions {
+            let (series_intervals, _) = visibility_intervals(
+                series,
+                station_position,
+                up,
+                east,
+                north,
+                min_elevation,
+                step_seconds,
+                total_seconds,
+            );
+            intervals.extend(series_intervals);
+        }
+        let merged = merge_intervals(intervals);
+        let total_access = interval_total(&merged);
+        let (mean_gap, station_max_gap) = gap_statistics(&merged, total_seconds);
+        let time_at = |seconds: f64| {
+            format_utc(start + ChronoDuration::milliseconds((seconds * 1000.0).round() as i64))
+        };
+        station_stats.push(StationAccessStat {
+            station_id: station.id.clone(),
+            station_name: station.name.clone(),
+            window_count: merged.len() as u32,
+            total_access_seconds: total_access,
+            mean_gap_seconds: mean_gap,
+            max_gap_seconds: station_max_gap,
+            first_access_utc: merged.first().map(|(start_seconds, _)| time_at(*start_seconds)),
+            last_access_end_utc: merged.last().map(|(_, end_seconds)| time_at(*end_seconds)),
+        });
+    }
+
+    Ok(ConstellationAnalysisReport {
+        satellite_ids: satellites.iter().map(|item| item.id.clone()).collect(),
+        satellite_names: satellites.iter().map(|item| item.name.clone()).collect(),
+        start: format_utc(start),
+        end: format_utc(end),
+        step_seconds,
+        min_elevation_deg,
+        region,
+        grid_step_deg,
+        total_points: coverage.total_points,
+        covered_points,
+        coverage_ratio,
+        multi_covered_points,
+        mean_access_count: if revisit_count > 0 {
+            access_sum / revisit_count as f64
+        } else {
+            0.0
+        },
+        mean_revisit_seconds: if revisit_count > 0 {
+            revisit_sum / revisit_count as f64
+        } else {
+            0.0
+        },
+        max_gap_seconds: max_gap,
+        station_stats,
+        coverage,
+        revisit_points,
+        note: "星座级统计：覆盖率为网格点被至少一颗卫星覆盖的比例；平均重访为同一网格点相邻 Access 窗口间隙的均值；最大间隙为分析窗口内的最坏间隙。".to_string(),
+    })
+}
+

@@ -2,12 +2,16 @@ mod ai;
 mod attitude;
 mod auth;
 mod config;
+mod constellation;
 mod db;
 mod environment;
 mod error;
 mod link;
 mod numerical;
 mod orbit;
+mod radar;
+mod rate_limit;
+mod report;
 mod routes;
 mod scenario;
 mod sensor;
@@ -56,12 +60,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         space: std::sync::Arc::new(space),
         ai: std::sync::Arc::new(ai),
         config: std::sync::Arc::new(config),
+        limiter: std::sync::Arc::new(rate_limit::RateLimiter::new(240, 60)),
     };
 
     let addr: SocketAddr = state.config.http_addr.parse()?;
 
     let app = Router::new()
-        .nest("/api/v1", routes::router())
+        .nest("/api/v1", routes::router(state.clone()))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

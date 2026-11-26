@@ -14,11 +14,13 @@ use crate::{
     auth::AuthUser,
     environment::{self, EnvironmentOptions, EnvironmentReport},
     error::AppError,
-    link::{self, LinkBudgetReport, LinkOptions},
+    link::{self, InterferenceReport, LinkBudgetReport, LinkOptions},
     orbit::{
-        self, AccessOptions, AccessReport, CoverageRegion, CoverageReport,
-        PropagationCompareReport,
+        self, AccessOptions, AccessReport, ConstellationAnalysisReport, CoverageRegion,
+        CoverageReport, PropagationCompareReport,
     },
+    radar::{self, RadarOptions, RadarReport},
+    report::{self, ReportDocument, ReportRequest},
     scenario::ScenarioData,
     state::AppState,
 };
@@ -32,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_jobs).post(create_job))
         .route("/{id}", get(get_job))
         .route("/{id}/csv", get(job_csv))
+        .route("/{id}/report", get(job_report))
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -90,6 +93,11 @@ struct CreateJobRequest {
 #[derive(Debug, Deserialize)]
 struct JobQuery {
     scenario_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportDownloadQuery {
+    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +184,55 @@ struct LinkParams {
     step_seconds: f64,
     #[serde(default)]
     options: LinkOptions,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConstellationAnalysisParams {
+    #[serde(default)]
+    satellite_ids: Option<Vec<String>>,
+    #[serde(default)]
+    station_ids: Option<Vec<String>>,
+    start: String,
+    end: String,
+    #[serde(default = "default_step")]
+    step_seconds: f64,
+    region: CoverageRegion,
+    #[serde(default = "default_grid_step")]
+    grid_step_deg: f64,
+    #[serde(default = "default_min_elevation")]
+    min_elevation_deg: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RadarParams {
+    satellite_id: String,
+    ground_station_id: String,
+    start: String,
+    end: String,
+    #[serde(default = "default_step")]
+    step_seconds: f64,
+    #[serde(default)]
+    options: RadarOptions,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InterferenceParams {
+    satellite_id: String,
+    ground_station_id: String,
+    #[serde(default)]
+    interferer_ids: Vec<String>,
+    start: String,
+    end: String,
+    #[serde(default = "default_step")]
+    step_seconds: f64,
+    #[serde(default)]
+    options: LinkOptions,
+    #[serde(default = "default_ci_threshold")]
+    threshold_ci_db: f64,
+}
+
+fn default_ci_threshold() -> f64 {
+    10.0
 }
 
 fn default_step() -> f64 {
@@ -287,6 +344,55 @@ fn validate_params(kind: &str, params: &Value) -> Result<(), AppError> {
                 .map_err(|err| AppError::BadRequest(format!("链路参数无效：{err}")))?;
             if params.satellite_id.trim().is_empty() || params.ground_station_id.trim().is_empty() {
                 return Err(AppError::BadRequest("请选择卫星与地面站".into()));
+            }
+            let start = parse_time(&params.start, "start")?;
+            let end = parse_time(&params.end, "end")?;
+            validate_window(start, end, params.step_seconds)
+        }
+        "constellation_analysis" => {
+            let params: ConstellationAnalysisParams = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("星座分析参数无效：{err}")))?;
+            if !(0.1..=30.0).contains(&params.grid_step_deg) {
+                return Err(AppError::BadRequest("网格步长需在 [0.1, 30] 度内".into()));
+            }
+            if !(0.0..=90.0).contains(&params.min_elevation_deg) {
+                return Err(AppError::BadRequest("最小仰角需在 [0, 90] 度内".into()));
+            }
+            let start = parse_time(&params.start, "start")?;
+            let end = parse_time(&params.end, "end")?;
+            validate_window(start, end, params.step_seconds)
+        }
+        "radar" => {
+            let params: RadarParams = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("雷达参数无效：{err}")))?;
+            if params.satellite_id.trim().is_empty() || params.ground_station_id.trim().is_empty() {
+                return Err(AppError::BadRequest("请选择卫星与地面站".into()));
+            }
+            let start = parse_time(&params.start, "start")?;
+            let end = parse_time(&params.end, "end")?;
+            validate_window(start, end, params.step_seconds)
+        }
+        "report" => {
+            let request: ReportRequest = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("报告参数无效：{err}")))?;
+            let start = parse_time(&request.start, "start")?;
+            let end = parse_time(&request.end, "end")?;
+            validate_window(start, end, request.step_seconds)
+        }
+        "interference" => {
+            let params: InterferenceParams = serde_json::from_value(params.clone())
+                .map_err(|err| AppError::BadRequest(format!("干扰参数无效：{err}")))?;
+            if params.satellite_id.trim().is_empty() || params.ground_station_id.trim().is_empty() {
+                return Err(AppError::BadRequest("请选择目标卫星与地面站".into()));
+            }
+            if params
+                .interferer_ids
+                .iter()
+                .filter(|id| !id.trim().is_empty() && **id != params.satellite_id)
+                .count()
+                == 0
+            {
+                return Err(AppError::BadRequest("请至少选择一个干扰源卫星".into()));
             }
             let start = parse_time(&params.start, "start")?;
             let end = parse_time(&params.end, "end")?;
@@ -444,6 +550,30 @@ async fn job_csv(
                 format!("link-budget-{id}.csv"),
             )
         }
+        "constellation_analysis" => {
+            let report: ConstellationAnalysisReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("星座分析结果解析失败：{err}")))?;
+            (
+                format!("\u{feff}{}", constellation_csv(&report)),
+                format!("constellation-analysis-{id}.csv"),
+            )
+        }
+        "radar" => {
+            let report: RadarReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("雷达结果解析失败：{err}")))?;
+            (
+                format!("\u{feff}{}", radar::radar_csv(&report)),
+                format!("radar-{id}.csv"),
+            )
+        }
+        "interference" => {
+            let report: InterferenceReport = serde_json::from_value(result)
+                .map_err(|err| AppError::Internal(format!("干扰结果解析失败：{err}")))?;
+            (
+                format!("\u{feff}{}", link::interference_csv(&report)),
+                format!("interference-{id}.csv"),
+            )
+        }
         _ => return Err(AppError::BadRequest("该任务类型不支持 CSV 导出".into())),
     };
 
@@ -459,6 +589,62 @@ async fn job_csv(
             ),
         ],
         csv,
+    )
+        .into_response())
+}
+
+async fn job_report(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ReportDownloadQuery>,
+) -> Result<Response, AppError> {
+    let row: Option<JobRow> = sqlx::query_as(&format!(
+        "SELECT id, scenario_id, kind, status, params, result, error, created_at, started_at, finished_at
+         FROM computation_jobs WHERE id = $3 AND {SCOPE}"
+    ))
+    .bind(user.org_id)
+    .bind(user.id)
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let row = row.ok_or(AppError::NotFound("任务不存在"))?;
+    if row.status != "succeeded" {
+        return Err(AppError::BadRequest("任务尚未完成，无法导出报告".into()));
+    }
+    let result = row
+        .result
+        .ok_or(AppError::BadRequest("任务没有结果".into()))?;
+    let document: ReportDocument = serde_json::from_value(result)
+        .map_err(|err| AppError::Internal(format!("报告结果解析失败：{err}")))?;
+
+    let format = query.format.unwrap_or_else(|| "html".to_string());
+    let (content_type, body, filename) = if format.eq_ignore_ascii_case("markdown")
+        || format.eq_ignore_ascii_case("md")
+    {
+        (
+            "text/markdown; charset=utf-8",
+            document.markdown,
+            format!("kst-report-{id}.md"),
+        )
+    } else {
+        (
+            "text/html; charset=utf-8",
+            document.html,
+            format!("kst-report-{id}.html"),
+        )
+    };
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
     )
         .into_response())
 }
@@ -538,6 +724,26 @@ fn compare_csv(report: &PropagationCompareReport) -> String {
             sample.numerical_altitude_km,
             sample.position_difference_km,
             sample.velocity_difference_km_s
+        ));
+    }
+    output
+}
+
+fn constellation_csv(report: &ConstellationAnalysisReport) -> String {
+    let mut output = String::from(
+        "latitude_deg,longitude_deg,access_count,visible_seconds,mean_gap_seconds,max_gap_seconds,max_elevation_deg,covered\n",
+    );
+    for point in &report.revisit_points {
+        output.push_str(&format!(
+            "{:.4},{:.4},{},{:.1},{:.1},{:.1},{:.3},{}\n",
+            point.latitude_deg,
+            point.longitude_deg,
+            point.access_count,
+            point.visible_seconds,
+            point.mean_gap_seconds,
+            point.max_gap_seconds,
+            point.max_elevation_deg,
+            if point.covered { 1 } else { 0 }
         ));
     }
     output
@@ -704,6 +910,64 @@ fn compute_job_result(kind: &str, params: &Value, scenario: &ScenarioData) -> Re
                 end,
                 params.step_seconds,
                 &params.options,
+            )?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "constellation_analysis" => {
+            let params: ConstellationAnalysisParams = serde_json::from_value(params.clone())
+                .map_err(|err| format!("星座分析参数无效：{err}"))?;
+            let start = parse_time(&params.start, "start").map_err(|err| err.to_string())?;
+            let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
+            let report = orbit::compute_constellation_analysis(
+                scenario,
+                params.satellite_ids.as_deref(),
+                params.station_ids.as_deref(),
+                start,
+                end,
+                params.step_seconds,
+                params.region,
+                params.grid_step_deg,
+                params.min_elevation_deg,
+            )?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "radar" => {
+            let params: RadarParams = serde_json::from_value(params.clone())
+                .map_err(|err| format!("雷达参数无效：{err}"))?;
+            let start = parse_time(&params.start, "start").map_err(|err| err.to_string())?;
+            let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
+            let report = radar::compute_radar(
+                scenario,
+                &params.satellite_id,
+                &params.ground_station_id,
+                start,
+                end,
+                params.step_seconds,
+                &params.options,
+            )?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "report" => {
+            let request: ReportRequest = serde_json::from_value(params.clone())
+                .map_err(|err| format!("报告参数无效：{err}"))?;
+            let document = report::generate(scenario, &request)?;
+            serde_json::to_value(document).map_err(|err| err.to_string())
+        }
+        "interference" => {
+            let params: InterferenceParams = serde_json::from_value(params.clone())
+                .map_err(|err| format!("干扰参数无效：{err}"))?;
+            let start = parse_time(&params.start, "start").map_err(|err| err.to_string())?;
+            let end = parse_time(&params.end, "end").map_err(|err| err.to_string())?;
+            let report = link::compute_interference(
+                scenario,
+                &params.satellite_id,
+                &params.ground_station_id,
+                &params.interferer_ids,
+                start,
+                end,
+                params.step_seconds,
+                &params.options,
+                params.threshold_ci_db,
             )?;
             serde_json::to_value(report).map_err(|err| err.to_string())
         }
