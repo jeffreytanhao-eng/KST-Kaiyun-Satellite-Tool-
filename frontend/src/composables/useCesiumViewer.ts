@@ -30,6 +30,7 @@ interface SatelliteVisual {
 interface SensorVisual {
   track: SensorTrack
   satelliteEnabled: boolean
+  sensorEnabled: boolean
   entities: Cesium.Entity[]
 }
 
@@ -157,6 +158,38 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     radarLine = null
   }
 
+  /**
+   * 仅同步对象的启用/禁用状态，不重建场景。
+   * 用于对象树开关：避免 removeAll() 导致所有轨道瞬间消失再重绘。
+   */
+  function applyEnabledStates(data: ScenarioData) {
+    for (const station of data.ground_stations) {
+      const entity = stationEntities.get(station.id)
+      if (entity) entity.show = station.enabled
+    }
+
+    for (const satellite of data.satellites) {
+      const visual = satellites.get(satellite.id)
+      if (!visual) continue
+      visual.data.enabled = satellite.enabled
+      visual.entity.show = satellite.enabled && Boolean(visual.track)
+      const orbit = viewer.value?.entities.getById(`orbit-${satellite.id}`)
+      if (orbit) orbit.show = satellite.enabled
+    }
+
+    const sensorEnabled = new Map(
+      data.sensors.map((sensor) => [sensor.id, sensor.enabled])
+    )
+    for (const visual of sensorVisuals) {
+      const enabled = sensorEnabled.get(visual.track.sensor_id)
+      if (enabled !== undefined) visual.sensorEnabled = enabled
+      const satelliteEnabled = satellites.get(visual.track.satellite_id)?.data.enabled
+      if (satelliteEnabled !== undefined) visual.satelliteEnabled = satelliteEnabled
+    }
+
+    setPlayhead(playhead)
+  }
+
   function renderScenario(data: ScenarioData, report: PropagationReport | null) {
     const instance = viewer.value
     if (!instance) return
@@ -212,6 +245,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
       if (track && track.samples.length > 1) {
         instance.entities.add({
           id: `orbit-${satellite.id}`,
+          show: satellite.enabled,
           polyline: {
             positions: Cesium.Cartesian3.fromDegreesArrayHeights(
               track.samples.flatMap((sample) => [
@@ -298,7 +332,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     for (const track of report?.sensor_tracks ?? []) {
       const sensor = sensorMap.get(track.sensor_id)
       const satellite = satellites.get(track.satellite_id)
-      if (!sensor || !sensor.enabled || !satellite) continue
+      if (!sensor || !satellite) continue
       const color = Cesium.Color.fromCssColorString(track.color || fallbackColor(0))
       const entities: Cesium.Entity[] = []
 
@@ -350,6 +384,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
       sensorVisuals.push({
         track,
         satelliteEnabled: satellite.data.enabled,
+        sensorEnabled: sensor.enabled,
         entities
       })
     }
@@ -428,7 +463,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
         ? sampleAt(satellite.track.samples, tSeconds)
         : null
       const frame = sensorSampleAt(visual.track.samples, tSeconds)
-      if (!visual.satelliteEnabled || !satelliteSample || !frame) {
+      if (!visual.sensorEnabled || !visual.satelliteEnabled || !satelliteSample || !frame) {
         for (const entity of visual.entities) entity.show = false
         continue
       }
@@ -1056,6 +1091,7 @@ export function useCesiumViewer(host: Ref<HTMLDivElement | null>) {
     ready,
     init,
     renderScenario,
+    applyEnabledStates,
     setPlayhead,
     highlightAccess,
     showCoverage,

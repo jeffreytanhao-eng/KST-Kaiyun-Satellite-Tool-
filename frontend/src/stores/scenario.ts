@@ -271,9 +271,18 @@ export const useScenarioStore = defineStore('scenario', () => {
     }
   }
 
-  async function saveData(data: ScenarioData) {
+  /**
+   * 保存场景数据。
+   *
+   * `resetResults` 默认为 true：轨道输入变化后旧的计算结果已失效。
+   * 仅切换对象启用状态时传入 false，避免清空传播/分析结果并触发重新计算。
+   */
+  async function saveData(
+    data: ScenarioData,
+    options: { resetResults?: boolean } = {}
+  ) {
     const updated = await save({ data })
-    resetResults()
+    if (options.resetResults !== false) resetResults()
     return updated
   }
 

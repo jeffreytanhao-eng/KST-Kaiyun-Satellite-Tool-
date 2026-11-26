@@ -422,21 +422,32 @@ async function onSaveObject() {
 }
 
 async function onToggleObject(payload: Selection & { enabled: boolean }) {
-  const data = cloneData()
+  const data = scenario.value?.data
   if (!data) return
-  if (payload.type === 'satellite') {
-    const satellite = data.satellites.find((item) => item.id === payload.id)
-    if (satellite) satellite.enabled = payload.enabled
-  } else if (payload.type === 'station') {
-    const station = data.ground_stations.find((item) => item.id === payload.id)
-    if (station) station.enabled = payload.enabled
-  } else {
-    const sensor = data.sensors.find((item) => item.id === payload.id)
-    if (sensor) sensor.enabled = payload.enabled
+  const target =
+    payload.type === 'satellite'
+      ? data.satellites.find((item) => item.id === payload.id)
+      : payload.type === 'station'
+        ? data.ground_stations.find((item) => item.id === payload.id)
+        : data.sensors.find((item) => item.id === payload.id)
+  if (!target) return
+
+  // 先本地生效，开关立即响应；只同步该对象的可见性，不重建整个场景。
+  const previous = target.enabled
+  target.enabled = payload.enabled
+  cesium.applyEnabledStates(data)
+  const snapshot = cloneData()
+  if (!snapshot) {
+    target.enabled = previous
+    cesium.applyEnabledStates(data)
+    return
   }
+
   try {
-    await store.saveData(data)
+    await store.saveData(snapshot, { resetResults: false })
   } catch (error) {
+    target.enabled = previous
+    cesium.applyEnabledStates(data)
     ElMessage.error(errorText(error))
   }
 }
@@ -979,12 +990,35 @@ async function onExportCsv() {
 /* ------------------------------ 生命周期 ------------------------------ */
 
 let lastScenarioId = ''
+let lastPropagationSignature = ''
+let lastStructureSignature = ''
+
+/**
+ * 场景结构签名：忽略 enabled 字段。
+ * 结构未变、只有启用状态变化时，只同步实体可见性，不重建场景。
+ */
+function structureSignature(data: ScenarioData) {
+  return JSON.stringify(data, (key, value) => (key === 'enabled' ? undefined : value))
+}
+
+/**
+ * 轨道输入签名：忽略对象自身的 enabled 字段。
+ * 仅切换启用状态不会改变轨道计算输入，无需重新传播。
+ */
+function propagationSignature(data: ScenarioData) {
+  return JSON.stringify(
+    { satellites: data.satellites, sensors: data.sensors },
+    (key, value) => (key === 'enabled' ? undefined : value)
+  )
+}
 
 watch(
   () => store.current,
   async (current) => {
     if (!current) {
       lastScenarioId = ''
+      lastPropagationSignature = ''
+      lastStructureSignature = ''
       selection.value = null
       cesium.clearCoverage()
       cesium.clearRadar()
@@ -1004,13 +1038,36 @@ watch(
       syncAccessDefaults()
     }
 
-    cesium.renderScenario(current.data, store.propagation)
-    if (changed) {
-      cesium.flyToScenario()
+    const signature = propagationSignature(current.data)
+    const inputsChanged = signature !== lastPropagationSignature
+    lastPropagationSignature = signature
+
+    const structure = structureSignature(current.data)
+    const structureChanged = structure !== lastStructureSignature
+    lastStructureSignature = structure
+
+    if (changed || structureChanged) {
+      cesium.renderScenario(current.data, store.propagation)
+      if (changed) {
+        cesium.flyToScenario()
+      }
+    } else {
+      // 仅启用状态变化：原地切换实体可见性，避免所有轨道消失后整体重绘。
+      cesium.applyEnabledStates(current.data)
     }
     syncObjectForm()
 
-    if (current.data.satellites.some((item) => item.enabled)) {
+    if (!current.data.satellites.some((item) => item.enabled)) return
+
+    // 只有轨道输入变化、切换场景，或新启用的卫星还没有轨迹时才重新传播。
+    // 单纯的启用/禁用切换直接复用现有轨迹渲染，避免数秒等待与目标整体消失。
+    const trackIds = new Set(
+      (store.propagation?.satellites ?? []).map((track) => track.satellite_id)
+    )
+    const missingTrack = current.data.satellites.some(
+      (item) => item.enabled && !trackIds.has(item.id)
+    )
+    if (changed || inputsChanged || missingTrack) {
       await triggerPropagation()
     }
   }
